@@ -10,6 +10,48 @@ permissions:
   contents: read
 
 jobs:
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Default checkout is a shallow, single-commit clone — gitleaks
+          # would only ever see the latest commit, silently never scanning
+          # the rest of history at all. fetch-depth: 0 pulls full history
+          # so a secret committed and later deleted still gets caught; the
+          # commit that introduced it is permanently in this public repo's
+          # history either way, and deleting the file today doesn't
+          # un-leak it.
+          fetch-depth: 0
+
+      # Fails on any real finding, no --audit-level-style carve-out, on
+      # purpose — this is a different risk shape than a dependency CVE.
+      # A CVE is theoretical until proven exploitable against how you
+      # actually use the vulnerable code, and a fix may genuinely not
+      # exist yet (see the npm audit step). A leaked secret has none of
+      # that ambiguity: the instant it's in git history — especially in a
+      # public repo like this one — it must be treated as already
+      # compromised, full stop, regardless of whether the finding "looks"
+      # exploitable. Known false positives (a placeholder in a docs
+      # example, a dev-only dummy value) get an explicit, reviewed
+      # .gitleaks.toml allowlist entry if one is ever needed — not a
+      # softened default that lets a real leak blend into ignorable noise.
+      #
+      # The upstream zricethezav/gitleaks image invoked directly via
+      # `docker run`, not the gitleaks/gitleaks-action marketplace action
+      # (uncertain licensing terms) and not the docker://image step
+      # syntax (args-nesting behavior not worth risking getting subtly
+      # wrong in YAML with no local way to verify it). A plain `run:`
+      # step is exactly the command already run and verified locally
+      # (18 commits, ~536KB scanned, no leaks found) before wiring it in
+      # — same image, same flags, nothing to trust blind.
+      - name: Scan full history for secrets (gitleaks)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --log-opts="--all" --redact -v
+
   backend:
     name: Backend (lint, migrate, RLS/auth proof, tests)
     runs-on: ubuntu-latest
@@ -63,6 +105,22 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Fails on ANY known CVE in a pinned version, deliberately strict —
+      # unlike the npm audit step in the frontend job below, there's no
+      # --audit-level=high carve-out here. Reasoning: every finding this
+      # step has actually caught so far (see CHANGELOG.md) had a real fix
+      # version available — this is a young, actively-maintained Python
+      # dependency set, not a deep npm-style transitive tree where an
+      # unfixable moderate finding sitting in some bundler's own internals
+      # is a routine, unavoidable occurrence. Strict-by-default is the
+      # right call until that assumption stops holding; if a genuinely
+      # unfixable finding shows up, the fix is an explicit, commented
+      # `--ignore-vuln <ID>` here — a deliberate, reviewed exception, not
+      # a silent downgrade to warn-only that nobody would notice going
+      # stale.
+      - name: Dependency vulnerability scan (pip-audit)
+        run: pip-audit -r requirements.txt
 
       # ruff over flake8: one Rust-speed tool instead of
       # flake8+isort+pyupgrade, and it's already what we validated locally.
@@ -178,6 +236,28 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # --audit-level=high, not the npm default (which fails on any
+      # finding including low/moderate): the npm ecosystem's deep
+      # transitive trees mean moderate findings buried in some tool's own
+      # internal bundled dependency are common and frequently have no fix
+      # available yet, unlike the backend's pip-audit step above, which is
+      # strict with no carve-out. Concrete example already living in this
+      # tree, not a hypothetical: Next.js 16.2.10 (the latest stable
+      # release as of this writing) bundles postcss@8.4.31 internally
+      # (GHSA-qx2v-qp2m-jg93, moderate, XSS via unescaped `</style>` in
+      # CSS stringify output) — `npm audit fix --force` "fixes" it by
+      # downgrading to next@9.3.3, a multi-year regression, not a real
+      # fix. No stable Next.js release has bumped this yet. The actual
+      # exploitability here is low regardless: this postcss instance only
+      # ever compiles our own authored Tailwind source at build time, not
+      # untrusted CSS supplied at runtime, which is the scenario the
+      # advisory describes. Tracked, accepted, not silently ignored —
+      # revisit when Next.js ships a stable release with a patched
+      # postcss. A HIGH or CRITICAL finding, here or anywhere else in the
+      # tree, still fails this step.
+      - name: Dependency vulnerability scan (npm audit)
+        run: npm audit --audit-level=high
 
       - name: Lint (ESLint)
         run: npm run lint

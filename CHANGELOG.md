@@ -786,3 +786,100 @@ assignee validation at all. Full six-script regression re-run
 afterward, plus `ruff check .` run locally this time before pushing —
 the ruff failure from the previous slice's first CI run was exactly the
 kind of thing that check would have caught before the push, not after.
+
+---
+
+## Slice 14 — Automated security scanning in CI
+
+**Built:** a new `secret-scan` job (gitleaks, full git history) and a
+`pip-audit`/`npm audit` step in the backend/frontend jobs respectively —
+plus the actual first scan's real findings, dealt with rather than just
+reported.
+
+**pip-audit: fails on any finding, no carve-out.** Backend dependencies
+here are a young, actively-maintained set with no deep vendored-tooling
+layers — every one of the 21 findings the very first run turned up (see
+below) had a real fix version available, none were the "no patch exists
+yet" case this slice was explicitly asked to reason about. Strict-by-
+default is the right call for as long as that keeps being true; the
+day a genuinely unfixable one shows up, the answer is an explicit,
+commented `--ignore-vuln <ID>` in the CI step — a reviewed exception,
+not a quiet retreat to warn-only that nobody would notice going stale
+six months later.
+
+**The first real scan found 21 vulnerabilities across 3 packages, and
+they were fixed, not just logged.** `pyjwt==2.10.1` (multiple PYSEC
+advisories, the library that signs and verifies every access token in
+this app), `starlette==0.41.3` (FastAPI's transitive ASGI layer,
+several CVEs), and `pytest==8.3.4` (dev-only). Fixed by bumping
+`pyjwt` to `2.13.0`, `pytest`/`pytest-asyncio` to `9.1.1`/`1.4.0` (the
+old `pytest-asyncio==0.25.0` pin doesn't support pytest 9, a real
+version-compatibility wrinkle discovered mid-upgrade, not anticipated),
+and `fastapi` to `0.139.0` — starlette isn't a direct pin in
+`requirements.txt` at all, it's pulled in transitively by FastAPI, so
+clearing its CVEs meant bumping FastAPI far enough that pip's resolver
+picks a patched starlette (`1.3.1`) on its own. That's a large jump
+(FastAPI `0.115.6` to `0.139.0`, over twenty minor releases, starlette
+`0.41.3` to `1.3.1`, a major-line jump) with real breaking-change risk
+on paper — verified safe empirically, not assumed: the full six-script
+proof-script regression, `ruff check .`, and a bare `pytest -v`
+collection run all passed clean against the upgraded stack before this
+was trusted.
+
+**npm audit: `--audit-level=high`, not the default (fails on anything,
+including low/moderate) — and there's a real, current finding
+demonstrating exactly why, not a hypothetical.** Next.js `16.2.10` (the
+latest *stable* release as of this scan) bundles `postcss@8.4.31`
+internally, which has a moderate XSS advisory
+(GHSA-qx2v-qp2m-jg93). `npm audit fix --force`'s suggested fix is to
+downgrade to `next@9.3.3` — a multi-year regression, not a fix; no
+stable Next.js release has bumped its internal postcss yet, only
+canary/preview builds have, which aren't safe to run in production.
+The actual exploitability is low regardless of severity label: this
+postcss instance only ever compiles this project's own authored
+Tailwind source at build time, never untrusted CSS supplied at
+runtime, which is the scenario the advisory actually describes.
+**Decision: accepted and tracked, not silently ignored** — noted
+directly in the CI step's own comment so it's visible at the exact
+point it's being allowed through, with a note to revisit once Next.js
+ships a stable release with a patched postcss. A HIGH or CRITICAL
+finding anywhere in the tree still fails this step; only this one
+specific moderate finding is why the threshold isn't the npm default.
+
+**gitleaks, run across full git history, not just the current
+tree — and it came back genuinely clean.** `fetch-depth: 0` on checkout
+is required for this to mean anything: the default shallow, single-
+commit clone would let gitleaks scan only the latest commit, silently
+never touching the other seventeen. Run locally first exactly as CI
+will run it before trusting the wiring: **18 commits, ~536KB scanned,
+zero leaks found.** No `.env` contents, no real JWT secret, no database
+credentials anywhere in this public repo's history — the git-ignore
+discipline around `.env` held, and the intentionally-fake CI/dev-only
+values (`wrkbase_ci_password`, `ci-test-secret-do-not-use-outside-ci`,
+`correct horse battery staple` as a proof-script test password) don't
+match gitleaks' structured-secret detection patterns, which is correct,
+expected behavior for values that were never real credentials in the
+first place — not a false negative to worry about.
+
+**Fails on any finding, no carve-out, and this one needed no argument
+either way — it just doesn't have the CVE ambiguity to be lenient
+about.** A dependency CVE is theoretical until proven exploitable
+against how the vulnerable code is actually used, and a fix may
+genuinely not exist. A leaked secret has none of that ambiguity: the
+moment it's in git history — especially a *public* repo's history —
+it has to be treated as already compromised, independent of whether
+the specific finding "looks" exploitable. A known false positive (a
+placeholder value in a docs example) gets an explicit, reviewed
+`.gitleaks.toml` allowlist entry if one is ever actually needed, not a
+softened default threshold that would let a real leak blend into
+routine noise.
+
+**The upstream `zricethezav/gitleaks` Docker image, invoked directly
+via a plain `docker run` step — not the `gitleaks/gitleaks-action`
+marketplace action.** Its current licensing terms weren't something
+that could be verified with confidence from here, and a raw `docker://`
+container-action step's `args`-nesting behavior wasn't worth risking
+getting subtly wrong in YAML with no local way to test it before
+pushing. A plain `run:` step invoking the exact command already run
+and verified locally has no such uncertainty — same image, same flags,
+nothing trusted blind.
