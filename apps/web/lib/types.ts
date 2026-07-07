@@ -48,6 +48,9 @@ export interface Ticket {
   workflowStateId: string;
   position: number;
   createdBy: string | null;
+  // Nullable: unassigned, or a removed member's old assignment (SET NULL
+  // on member removal, same as createdBy) — see migration 0009.
+  assigneeId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -67,6 +70,7 @@ interface TicketApiResponse {
   workflow_state_id: string;
   position: number;
   created_by: string | null;
+  assignee_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -83,6 +87,7 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     workflowStateId: data.workflow_state_id,
     position: data.position,
     createdBy: data.created_by,
+    assigneeId: data.assignee_id,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
   };

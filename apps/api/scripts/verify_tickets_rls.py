@@ -169,6 +169,43 @@ async def main() -> None:
         )
         print("PASS: /tickets/tree nests epic -> story -> subtask correctly")
 
+        # --- assignee: same-org assignment works ------------------------------
+        own_org_user_id = ticket_a["created_by"]
+        assign_resp = await client.patch(
+            f"/projects/{project_a['id']}/tickets/{ticket_a['id']}",
+            json={"assignee_id": own_org_user_id},
+            headers=auth_headers(token_a),
+        )
+        assign_resp.raise_for_status()
+        assert assign_resp.json()["assignee_id"] == own_org_user_id
+        print("PASS: assigning a ticket to a real member of its own org succeeds")
+
+        # --- assignee: cannot assign to a user from a different org -----------
+        # No composite-FK-bypassing app-layer trust here: org_b's real user
+        # id (org B's project creator) is a genuine user row, just in the
+        # wrong org — structurally rejected by _validate_assignee before it
+        # ever reaches the DB's composite FK.
+        cross_org_user_id = project_b["created_by"]
+        cross_assign_resp = await client.patch(
+            f"/projects/{project_a['id']}/tickets/{ticket_a['id']}",
+            json={"assignee_id": cross_org_user_id},
+            headers=auth_headers(token_a),
+        )
+        assert cross_assign_resp.status_code == 422, (
+            f"expected 422, got {cross_assign_resp.status_code}"
+        )
+        print("PASS: assigning a ticket to a user from a different org is rejected (422)")
+
+        # --- assignee: unassigning (null) doesn't need validation -------------
+        unassign_resp = await client.patch(
+            f"/projects/{project_a['id']}/tickets/{ticket_a['id']}",
+            json={"assignee_id": None},
+            headers=auth_headers(token_a),
+        )
+        unassign_resp.raise_for_status()
+        assert unassign_resp.json()["assignee_id"] is None
+        print("PASS: unassigning a ticket (assignee_id: null) succeeds")
+
     print("\nAll ticket tenant-isolation and hierarchy checks passed.")
 
 

@@ -201,6 +201,18 @@ class Ticket(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    # No single-column FK here either — same composite-FK reasoning as
+    # workflow_state_id: the real constraint is (assignee_id, org_id) ->
+    # users(id, org_id) in migration 0009, org-scoped rather than
+    # project-scoped since there's no per-project membership in this app —
+    # any org member is a valid assignee for any ticket in any of that
+    # org's projects. Without the composite FK, RLS alone wouldn't stop
+    # assigning a ticket to a real user_id from a *different* org: RLS on
+    # `tickets` only checks the ticket's own org_id, never the org of the
+    # user a foreign key happens to point at. SET NULL on delete for the
+    # same reason as created_by: a removed member's tickets are kept, just
+    # unassigned, not destroyed or blocked from being removed.
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()

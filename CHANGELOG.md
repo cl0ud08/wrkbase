@@ -701,3 +701,88 @@ title, and there's no ticket detail view yet. So there's nothing to
 break — not because `NULL` is handled gracefully, but because the field
 isn't surfaced in the UI at all yet, a pre-existing gap rather than a
 new one this migration introduced.
+
+---
+
+## Slice 13 — Ticket assignee
+
+**Built:** `tickets.assignee_id` (migration 0009), folded into the
+existing `PATCH /tickets/{id}`, an assignee picker + initials badge on
+the Kanban card, and three new checks in `verify_tickets_rls.py`.
+
+**The composite-FK question, answered the same way a fourth time —
+worth stating as the general rule, not just the specific case.** RLS
+scopes rows in the table it's defined on; it says nothing about what a
+foreign key on that row happens to point at in some *other* table. A
+plain `assignee_id: ForeignKey("users.id")` would let a ticket in org A
+be assigned to a real `user_id` from org B — a legitimate row, just in
+the wrong tenant — and RLS on `tickets` would never notice, because it
+only ever checks `tickets.org_id`, never the org of whatever the row's
+other columns reference. This is exactly the same gap
+`fk_tickets_project_org`, `fk_tickets_parent_project`, and
+`fk_tickets_workflow_state_project` already closed, applied here a
+fourth time: `(assignee_id, org_id) -> users(id, org_id)`, backed by a
+new `uq_users_id_org_id` constraint the same way the earlier ones needed
+their own supporting unique constraint on the referenced side. The
+general rule this keeps confirming: **any column that references a row
+in another table, where that table is itself tenant-scoped, needs a
+composite FK pinning both rows to the same org — a single-column FK is
+never enough on its own once RLS is the thing doing the tenant
+isolation.** Org-scoped rather than project-scoped this time, unlike
+`workflow_state_id`: this app has no per-project membership, so any
+member of the ticket's org is a valid assignee for any ticket in any of
+that org's projects — one dimension, not two.
+
+**Folded into the existing `PATCH /tickets/{id}` rather than a new
+`PATCH /tickets/{id}/assignee` route.** A dedicated endpoint would
+duplicate `_get_ticket_or_404`, the 404-vs-403 handling, and response
+serialization for no real benefit — `TicketUpdate`'s `exclude_unset`
+PATCH semantics already express "change just the assignee" cleanly as
+`{"assignee_id": "..."}`, the same way they already express "just move
+this card" as `{"workflow_state_id": ..., "position": ...}`. One
+flexible endpoint with field-based authorization branching is the
+established idiom here, not a REST-purity split.
+
+**Authorization: any org member, not creator/admin-only.** Assigning a
+ticket — picking up an unowned one, or handing yours to a teammate — is
+ordinary team behavior, not a privileged action; gating it behind
+creator-or-admin would mean only the person who happened to file a
+ticket could ever hand it to someone else, which breaks the basic point
+of a shared board the same way restricting drag-and-drop to a ticket's
+creator would have. `assignee_id` joins `workflow_state_id`/`position`
+in what used to be called `_MOVE_ONLY_FIELDS` — renamed
+`_COLLABORATIVE_FIELDS`, since "move-only" stopped being an accurate
+name for the set the moment a third, non-move field joined it. Editing
+what a ticket actually *says* (title/description/type/parent) still
+requires creator-or-admin; assigning it doesn't.
+
+**Member removal: `SET NULL`, consistent with `created_by`, no reason
+to diverge.** Same reasoning as migration 0008 — a removed member's
+assigned tickets are kept, just unassigned, not destroyed or blocked
+from being removed. The frontend renders this as "Unassigned" (the
+picker's empty option, and a plain `?` in the initials badge) rather
+than leaving a blank or broken-looking card.
+
+**A new dnd-kit gotcha, worth flagging as a general pattern, not a
+one-off.** The Kanban card's outer `<div>` carries dnd-kit's drag
+listeners (`{...listeners}`, spread there since the whole card is
+draggable), and the assignee `<select>` is a child of that div. Without
+`onPointerDown={(e) => e.stopPropagation()}` on the select, opening the
+dropdown registers as a pointer-down on the card underneath it too —
+dnd-kit reads that as the start of a drag gesture. This isn't specific
+to `<select>`: **any future interactive control added directly onto a
+draggable card — a button, a checkbox, a text input — will need the
+same `stopPropagation` on pointer-down**, or it'll either fight the drag
+gesture or get swallowed by it. Worth remembering as a checklist item
+the next time something interactive lands on a card, not rediscovering
+it fresh.
+
+**Verified, not just built.** Three new checks in
+`verify_tickets_rls.py`: assigning within the same org succeeds,
+assigning to a real user from a *different* org is rejected (422,
+caught by `_validate_assignee` before it ever reaches the DB's composite
+FK), and unassigning (`assignee_id: null`) succeeds without triggering
+assignee validation at all. Full six-script regression re-run
+afterward, plus `ruff check .` run locally this time before pushing —
+the ruff failure from the previous slice's first CI run was exactly the
+kind of thing that check would have caught before the push, not after.

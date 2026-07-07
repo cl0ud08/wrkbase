@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
-from app.db.models import Project, Ticket, TicketType, UserRole, WorkflowState
+from app.db.models import Project, Ticket, TicketType, User, UserRole, WorkflowState
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketRead, TicketTreeNode, TicketUpdate
 
@@ -15,15 +15,20 @@ router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
 _PROJECT_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 _TICKET_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
 
-# Fields that make up a "move" (drag a card to a column / reorder it)
-# rather than a content edit. See _require_owner_or_admin's call sites:
-# moving a card is core, everyday board collaboration — restricting it to
-# the ticket's creator or an admin would mean only Alice could ever drag
-# her own cards to Done, which breaks the basic point of a shared board.
-# Editing what a ticket actually says stays creator-or-admin, same as
-# Projects. A request touching both a move field and a content field is
-# treated as a content edit — the stricter rule wins.
-_MOVE_ONLY_FIELDS = {"workflow_state_id", "position"}
+# Fields that make up "core board interaction" (drag a card to a column /
+# reorder it / assign it to someone) rather than a content edit. See
+# _require_owner_or_admin's call sites: moving a card is everyday board
+# collaboration — restricting it to the ticket's creator or an admin would
+# mean only Alice could ever drag her own cards to Done. Assigning a
+# ticket is the same kind of action: picking up an unowned ticket, or
+# reassigning one to a teammate, is normal team behavior that shouldn't
+# require being the creator or an admin — the same reasoning Jira/Linear
+# apply by not gating "assign" behind an ownership check either. Editing
+# what a ticket actually says (title/description/type/parent) stays
+# creator-or-admin, same as Projects. A request touching both a
+# collaborative field and a content field is treated as a content edit —
+# the stricter rule wins.
+_COLLABORATIVE_FIELDS = {"workflow_state_id", "position", "assignee_id"}
 
 
 async def _get_project_or_404(db: AsyncSession, project_id: uuid.UUID) -> Project:
@@ -114,6 +119,21 @@ async def _validate_workflow_state(
     return state
 
 
+async def _validate_assignee(db: AsyncSession, org_id: uuid.UUID, assignee_id: uuid.UUID) -> None:
+    # Org-scoped, not project-scoped, unlike _validate_workflow_state: this
+    # app has no per-project membership, so any member of the ticket's org
+    # is eligible. Same shape as the other _validate_x helpers — the
+    # composite FK (migration 0009) already guarantees this at the DB
+    # level, but checking first turns a bad id into a clean 422 instead of
+    # a raw IntegrityError.
+    result = await db.execute(select(User).where(User.id == assignee_id, User.org_id == org_id))
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="assignee_id must reference a user who is a member of this org",
+        )
+
+
 async def _get_default_workflow_state(db: AsyncSession, project_id: uuid.UUID) -> WorkflowState:
     result = await db.execute(
         select(WorkflowState).where(
@@ -160,6 +180,9 @@ async def create_ticket(
     if position is None:
         position = await _next_position(db, workflow_state_id)
 
+    if payload.assignee_id is not None:
+        await _validate_assignee(db, auth.org_id, payload.assignee_id)
+
     ticket = Ticket(
         org_id=auth.org_id,
         project_id=project_id,
@@ -169,6 +192,7 @@ async def create_ticket(
         description=payload.description,
         workflow_state_id=workflow_state_id,
         position=position,
+        assignee_id=payload.assignee_id,
         created_by=auth.user_id,
     )
     db.add(ticket)
@@ -248,7 +272,7 @@ async def update_ticket(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    if not set(update_data.keys()) <= _MOVE_ONLY_FIELDS:
+    if not set(update_data.keys()) <= _COLLABORATIVE_FIELDS:
         _require_owner_or_admin(ticket, auth)
 
     if "type" in update_data or "parent_id" in update_data:
@@ -258,6 +282,9 @@ async def update_ticket(
 
     if "workflow_state_id" in update_data:
         await _validate_workflow_state(db, project_id, update_data["workflow_state_id"])
+
+    if update_data.get("assignee_id") is not None:
+        await _validate_assignee(db, auth.org_id, update_data["assignee_id"])
 
     for field, value in update_data.items():
         setattr(ticket, field, value)

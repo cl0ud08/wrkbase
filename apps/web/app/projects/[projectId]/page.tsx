@@ -15,7 +15,21 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 
 import { apiFetch } from "../../../lib/api";
-import { mapTicket, mapWorkflowState, type Ticket, type WorkflowState } from "../../../lib/types";
+import {
+  mapMember,
+  mapTicket,
+  mapWorkflowState,
+  type Member,
+  type Ticket,
+  type WorkflowState,
+} from "../../../lib/types";
+
+// First two chars of the email's local part — no display-name field exists
+// on User yet, so email is the only identity data available to derive a
+// compact badge from.
+function initials(email: string): string {
+  return email.slice(0, 2).toUpperCase();
+}
 
 function columnTickets(tickets: Ticket[], stateId: string): Ticket[] {
   return tickets.filter((t) => t.workflowStateId === stateId).sort((a, b) => a.position - b.position);
@@ -33,7 +47,15 @@ function computePosition(siblings: Ticket[], index: number): number {
   return (siblings[index - 1].position + siblings[index].position) / 2;
 }
 
-function Card({ ticket }: { ticket: Ticket }) {
+function Card({
+  ticket,
+  members,
+  onAssigneeChange,
+}: {
+  ticket: Ticket;
+  members: Member[];
+  onAssigneeChange: (ticketId: string, assigneeId: string | null) => void;
+}) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: ticket.id,
   });
@@ -42,6 +64,8 @@ function Card({ ticket }: { ticket: Ticket }) {
     transition,
     opacity: isDragging ? 0.4 : 1,
   };
+  const assignee = members.find((m) => m.id === ticket.assigneeId);
+
   return (
     <div
       ref={setNodeRef}
@@ -50,10 +74,35 @@ function Card({ ticket }: { ticket: Ticket }) {
       {...listeners}
       className="cursor-grab rounded-lg border border-black/[.08] bg-white p-3 text-sm shadow-sm active:cursor-grabbing dark:border-white/[.145] dark:bg-zinc-900"
     >
-      <span className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
-        {ticket.type}
-      </span>
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
+          {ticket.type}
+        </span>
+        <span
+          title={assignee ? assignee.email : "Unassigned"}
+          className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-black/[.08] text-[10px] font-medium text-zinc-700 dark:bg-white/[.12] dark:text-zinc-300"
+        >
+          {assignee ? initials(assignee.email) : "?"}
+        </span>
+      </div>
       <p className="font-medium text-black dark:text-zinc-50">{ticket.title}</p>
+      <select
+        value={ticket.assigneeId ?? ""}
+        onChange={(e) => onAssigneeChange(ticket.id, e.target.value || null)}
+        // dnd-kit's drag listeners are spread on this card's outer div
+        // ({...listeners} above) and fire on pointerdown; without stopping
+        // propagation here, opening this native <select> would also be
+        // read as the start of a drag gesture on the card underneath it.
+        onPointerDown={(e) => e.stopPropagation()}
+        className="mt-2 w-full cursor-pointer rounded-md border border-black/[.08] bg-transparent px-2 py-1 text-xs text-zinc-700 dark:border-white/[.145] dark:text-zinc-300"
+      >
+        <option value="">Unassigned</option>
+        {members.map((member) => (
+          <option key={member.id} value={member.id}>
+            {member.email}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -61,9 +110,13 @@ function Card({ ticket }: { ticket: Ticket }) {
 function Column({
   state,
   tickets,
+  members,
+  onAssigneeChange,
 }: {
   state: WorkflowState;
   tickets: Ticket[];
+  members: Member[];
+  onAssigneeChange: (ticketId: string, assigneeId: string | null) => void;
 }) {
   // useDroppable on the column itself, in addition to the SortableContext
   // around its cards: dnd-kit's sortable list only gives you a drop target
@@ -84,7 +137,12 @@ function Column({
       <SortableContext items={tickets.map((t) => t.id)} strategy={verticalListSortingStrategy}>
         <div className="flex min-h-[40px] flex-col gap-2">
           {tickets.map((ticket) => (
-            <Card key={ticket.id} ticket={ticket} />
+            <Card
+              key={ticket.id}
+              ticket={ticket}
+              members={members}
+              onAssigneeChange={onAssigneeChange}
+            />
           ))}
         </div>
       </SortableContext>
@@ -97,6 +155,7 @@ export default function ProjectBoardPage() {
 
   const [states, setStates] = useState<WorkflowState[] | null>(null);
   const [tickets, setTickets] = useState<Ticket[] | null>(null);
+  const [members, setMembers] = useState<Member[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -105,9 +164,10 @@ export default function ProjectBoardPage() {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
   const load = useCallback(async () => {
-    const [statesRes, ticketsRes] = await Promise.all([
+    const [statesRes, ticketsRes, membersRes] = await Promise.all([
       apiFetch(`/api/projects/${projectId}/workflow-states`),
       apiFetch(`/api/projects/${projectId}/tickets`),
+      apiFetch(`/api/org/members`),
     ]);
     if (statesRes.ok) {
       const data = await statesRes.json();
@@ -115,6 +175,9 @@ export default function ProjectBoardPage() {
     }
     if (ticketsRes.ok) {
       setTickets((await ticketsRes.json()).map(mapTicket));
+    }
+    if (membersRes.ok) {
+      setMembers((await membersRes.json()).map(mapMember));
     }
   }, [projectId]);
 
@@ -198,6 +261,26 @@ export default function ProjectBoardPage() {
     }
   }
 
+  // Same optimistic-then-rollback shape as handleDragEnd: assigning is
+  // just as core a collaborative action as moving a card (see
+  // _COLLABORATIVE_FIELDS in the backend), so it gets the same instant-
+  // feedback treatment rather than waiting on a round trip.
+  async function handleAssigneeChange(ticketId: string, assigneeId: string | null) {
+    if (!tickets) return;
+    const previousTickets = tickets;
+    setTickets(tickets.map((t) => (t.id === ticketId ? { ...t, assigneeId } : t)));
+
+    const res = await apiFetch(`/api/projects/${projectId}/tickets/${ticketId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ assignee_id: assigneeId }),
+    });
+    if (!res.ok) {
+      setError("Failed to change assignee.");
+      setTickets(previousTickets);
+    }
+  }
+
   return (
     <div className="flex flex-1 flex-col gap-6 bg-zinc-50 px-6 py-10 font-sans dark:bg-black">
       <div className="flex items-center justify-between">
@@ -254,7 +337,13 @@ export default function ProjectBoardPage() {
         <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
           <div className="flex gap-4 overflow-x-auto pb-4">
             {states.map((state) => (
-              <Column key={state.id} state={state} tickets={columnTickets(tickets, state.id)} />
+              <Column
+                key={state.id}
+                state={state}
+                tickets={columnTickets(tickets, state.id)}
+                members={members}
+                onAssigneeChange={handleAssigneeChange}
+              />
             ))}
           </div>
         </DndContext>

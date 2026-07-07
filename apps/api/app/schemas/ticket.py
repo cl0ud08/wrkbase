@@ -15,6 +15,9 @@ class TicketCreate(BaseModel):
     # that column — the endpoint fills both in when omitted.
     workflow_state_id: uuid.UUID | None = None
     position: float | None = None
+    # None = unassigned. Allowed at creation for symmetry with PATCH rather
+    # than forcing a create-then-immediately-assign round trip.
+    assignee_id: uuid.UUID | None = None
 
 
 class TicketUpdate(BaseModel):
@@ -25,6 +28,7 @@ class TicketUpdate(BaseModel):
     description: str | None = None
     workflow_state_id: uuid.UUID | None = None
     position: float | None = None
+    assignee_id: uuid.UUID | None = None
 
 
 class TicketRead(BaseModel):
@@ -42,6 +46,9 @@ class TicketRead(BaseModel):
     # Nullable: a removed member's tickets are kept, not deleted, with
     # created_by set to NULL (migration 0008) — see app/api/org.py.
     created_by: uuid.UUID | None
+    # Nullable: unassigned, or a removed member's old assignment (migration
+    # 0009 sets this NULL on member removal, same as created_by).
+    assignee_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 
