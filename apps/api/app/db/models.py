@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Enum, ForeignKey, String, text
+from sqlalchemy import Enum, FetchedValue, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -75,4 +75,32 @@ class UserLookup(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,
+    )
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    # RESTRICT, not CASCADE: deleting a user shouldn't silently wipe out
+    # every project they ever created. No user-deletion flow exists yet, so
+    # this is a forward-looking default, not a tested constraint.
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+    # server_onupdate (not server_default): this table has a BEFORE UPDATE
+    # trigger (migration 0004) that sets updated_at = now() on every UPDATE.
+    # Without this marker SQLAlchemy has no way to know the trigger changed
+    # the row, and the in-memory object would show a stale timestamp after
+    # commit until something explicitly re-fetched it.
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=text("now()"), server_onupdate=FetchedValue()
     )
