@@ -1,9 +1,10 @@
 # Changelog
 
-Chronological build log for Wrkbase's Phase 0 (foundation). Each entry
-covers what was built and the reasoning behind the decisions that mattered
-— written for interview prep, not just a feature list. Built 2026-07-06
-through 2026-07-07.
+Chronological build log for Wrkbase, covering Phase 0 (foundation) and
+Phase 1 (product features) as they ship. Each entry covers what was built
+and the reasoning behind the decisions that mattered — written for
+interview prep, not just a feature list. Phase 0 built 2026-07-06 through
+2026-07-07; Phase 1 begins 2026-07-07.
 
 ---
 
@@ -275,3 +276,68 @@ proof scripts, and the API health-check wait loop — then torn down.
 Stronger evidence than "the YAML parses": proof the commands work outside
 the existing dev containers, which is the exact failure mode CI exists to
 catch.
+
+---
+
+## Slice 7 — Projects CRUD (Phase 1 begins)
+
+**Built:** the `Project` model, migration 0004 (table + RLS in the same
+migration), full CRUD (`POST`/`GET`/`GET one`/`PATCH`/`DELETE
+/projects`), a rough creator-or-admin authorization check,
+`scripts/verify_projects_rls.py`, and a real `/dashboard` project list +
+create form replacing the Phase 0 placeholder.
+
+**Contract first.** `Project` (SQLAlchemy) → `ProjectCreate` /
+`ProjectUpdate` / `ProjectRead` (Pydantic) → the TypeScript `Project`
+interface — all defined before any endpoint logic, so the shape of the
+resource was settled before its behavior was.
+
+**`NULLIF` from the start, not rediscovered.** Migration 0004's policy
+uses `NULLIF(current_setting(...), '')` immediately, applying the lesson
+migration 0003 had to learn the hard way in Slice 2, instead of
+reintroducing the same empty-string bug in every new table's RLS policy.
+
+**The `eager_defaults` / `MissingGreenlet` bug — genuinely new, and
+reusable beyond this table.** The first real UPDATE through the API
+returned a 500, not the updated row. Cause: `projects.updated_at` is
+maintained by a Postgres `BEFORE UPDATE` trigger, marked on the
+SQLAlchemy model with `server_onupdate=FetchedValue()` so the ORM knows
+the column changes server-side. Under sync SQLAlchemy that's enough — the
+ORM lazily re-fetches the value on next access. Under **async**
+SQLAlchemy, that lazy re-fetch needs an `await`, and FastAPI's response
+serialization reads the attribute without one, so the load crashed
+instead of just being slow. Fixed with `__mapper_args__ =
+{"eager_defaults": True}` on `Project`, which forces the UPDATE statement
+itself to `RETURNING` the trigger-modified column, so the in-memory
+object is already correct before serialization ever touches it. This
+isn't specific to projects: **any future table with a DB-side trigger
+touching a column the ORM tracks will hit the same crash** — tickets
+(status timestamps, comment counts) are the next obvious candidate, and
+this needs to go on them too, not get rediscovered the hard way again.
+
+**404 vs. 403 — two different trust boundaries, two different codes.** A
+project ID from another org returns `404`: RLS makes "doesn't exist" and
+"exists in another org" indistinguishable at the query level, and the
+endpoint deliberately never reveals which. A project that *is* visible
+(same org, RLS already let it through) but isn't owned by the caller and
+isn't editable by an admin returns `403` instead — existence within your
+own tenant isn't sensitive, only cross-tenant existence is.
+`scripts/verify_projects_rls.py` proves the first case directly: org A
+directly GETs and PATCHes org B's real project ID and gets `404` both
+times, then re-reads org B's project to confirm it's genuinely untouched
+— not just absent from a list.
+
+**Rough authorization, flagged as rough.** Any authenticated org member
+can create a project; only the creator or an org admin can update or
+delete it. No per-project roles or sharing yet — noted as future work in
+the code, not silently assumed to be enough long-term.
+
+**Proof that Phase 0's wiring holds for a brand-new resource, not just
+the auth endpoints it was built alongside.** `GET /projects` has no
+`WHERE org_id = ...` anywhere in its code — it's a plain `SELECT * FROM
+projects`, and it's still correctly tenant-scoped, because
+`get_current_auth` already called `set_tenant_context` before the query
+ran. That's the actual payoff of Phase 0's RLS investment: a new resource
+type inherits tenant isolation for free just by using the existing
+dependency — the one real friction point was an async-ORM/trigger
+interaction, not the tenancy model itself.
