@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (lint, migrate, RLS/auth proof, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    env:
+      POSTGRES_USER: wrkbase
+      POSTGRES_PASSWORD: wrkbase_ci_password
+      POSTGRES_DB: wrkbase
+      APP_DB_USER: wrkbase_app
+      APP_DB_PASSWORD: wrkbase_app_ci_password
+      DATABASE_URL: postgresql+asyncpg://wrkbase_app:wrkbase_app_ci_password@localhost:5432/wrkbase
+      ADMIN_DATABASE_URL: postgresql+asyncpg://wrkbase:wrkbase_ci_password@localhost:5432/wrkbase
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET_KEY: ci-test-secret-do-not-use-outside-ci
+      CORS_ORIGINS: http://localhost:3000
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: wrkbase
+          POSTGRES_PASSWORD: wrkbase_ci_password
+          POSTGRES_DB: wrkbase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U wrkbase -d wrkbase"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: apps/api/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ruff over flake8: one Rust-speed tool instead of
+      # flake8+isort+pyupgrade, and it's already what we validated locally.
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Run database migrations
+        run: alembic upgrade head
+
+      - name: Seed dev data (verify_rls.py expects it)
+        run: python -m scripts.seed
+
+      # The single most important proof in this repo: default-deny with no
+      # tenant context, strict cross-org read isolation, and a cross-tenant
+      # write rejected by WITH CHECK. Its own step, clearly labeled, so a
+      # failure here is never mistaken for an ordinary test flake.
+      - name: Verify RLS tenant isolation
+        run: python -m scripts.verify_rls
+
+      - name: Start API server for the auth+RLS integration proof
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && exit 0
+            sleep 1
+          done
+          echo "API did not become healthy in time" >&2
+          exit 1
+
+      # Proves auth + RLS are wired together, not just each correct in
+      # isolation: real HTTP signup/login/refresh-rotation/logout across two
+      # separate orgs. Also its own step for the same reason as above.
+      - name: Verify auth + RLS integration
+        run: python -m scripts.verify_auth_rls
+
+      - name: Run pytest suite (if any test files exist yet)
+        run: |
+          if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
+            pytest -v
+          else
+            echo "No pytest test files yet — nothing to run."
+          fi
+
+  frontend:
+    name: Frontend (lint, type-check, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    env:
+      # Read by next.config.ts's rewrite proxy; no real API needs to be
+      # running for lint/type-check/build, just a syntactically valid value.
+      API_INTERNAL_URL: http://localhost:8000
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build

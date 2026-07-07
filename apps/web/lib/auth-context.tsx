@@ -47,7 +47,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // every page" fetch. Client-side navigations between pages don't remount
   // providers above the page level, so this state just persists.
   useEffect(() => {
-    refreshUser();
+    (async () => {
+      await refreshUser();
+    })();
   }, [refreshUser]);
 
   const logout = useCallback(async () => {

@@ -1,16 +1,20 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from slowapi.util import get_remote_address
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from slowapi.util import get_remote_address
-
 from app.api.deps import AuthContext, get_current_auth
 from app.core.config import settings
 from app.core.rate_limit import limiter
-from app.core.security import create_access_token, generate_refresh_token, hash_password, verify_password
+from app.core.security import (
+    create_access_token,
+    generate_refresh_token,
+    hash_password,
+    verify_password,
+)
 from app.db.models import Organization, User, UserLookup, UserRole
 from app.db.session import get_db, set_tenant_context
 from app.schemas.auth import LoginRequest, LogoutRequest, RefreshRequest, SignupRequest, TokenPair
