@@ -6,6 +6,8 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
+from app.api.invites import router as invites_router
+from app.api.org import router as org_router
 from app.api.projects import router as projects_router
 from app.api.tickets import router as tickets_router
 from app.api.workflow_states import router as workflow_states_router
@@ -45,3 +47,5 @@ app.include_router(auth_router)
 app.include_router(projects_router)
 app.include_router(tickets_router)
 app.include_router(workflow_states_router)
+app.include_router(invites_router)
+app.include_router(org_router)

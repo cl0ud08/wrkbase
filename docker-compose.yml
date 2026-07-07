@@ -29,6 +29,7 @@ services:
     build: ./apps/api
     environment:
       CORS_ORIGINS: ${CORS_ORIGINS}
+      FRONTEND_URL: ${FRONTEND_URL}
       # App runtime: least-privilege role, subject to RLS.
       DATABASE_URL: postgresql+asyncpg://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
       # Migrations only (alembic/env.py reads this directly): superuser, bypasses RLS,

@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from slowapi.util import get_remote_address
@@ -15,7 +16,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.db.models import Organization, User, UserLookup, UserRole
+from app.db.models import Invite, InviteLookup, Organization, User, UserLookup, UserRole
 from app.db.session import get_db, set_tenant_context
 from app.schemas.auth import LoginRequest, LogoutRequest, RefreshRequest, SignupRequest, TokenPair
 from app.services.refresh_tokens import pop_refresh_token, revoke_refresh_token, store_refresh_token
@@ -25,6 +26,57 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 _INVALID_CREDENTIALS = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password"
 )
+_INVALID_INVITE = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid, expired, or already-used invite link"
+)
+
+
+async def _redeem_invite(db: AsyncSession, token: str, email: str) -> tuple[uuid.UUID, UserRole]:
+    """Validate an invite token and mark it accepted, returning the
+    (org_id, role) the new user should be created with. Does NOT commit —
+    the caller commits this together with the User insert, in one
+    transaction, so a token can never be marked accepted without the user
+    it was accepted for actually existing (and vice versa).
+    """
+    # Step 1: same two-step shape as login() below — find the org from an
+    # unguessable token BEFORE any tenant context exists to scope an
+    # RLS-protected read with. invite_lookup carries nothing sensitive
+    # (see app/db/models.py), same as user_lookup for the login case.
+    lookup_result = await db.execute(select(InviteLookup).where(InviteLookup.token == token))
+    lookup = lookup_result.scalar_one_or_none()
+    if lookup is None:
+        raise _INVALID_INVITE
+
+    # Step 2: now that the org is known, the real row can be read through
+    # the normal RLS-protected path, same as login()'s second step.
+    await set_tenant_context(db, lookup.org_id)
+    invite_result = await db.execute(select(Invite).where(Invite.id == lookup.invite_id))
+    invite = invite_result.scalar_one_or_none()
+    if invite is None:
+        raise _INVALID_INVITE
+
+    if invite.accepted_at is not None or invite.expires_at < datetime.now(timezone.utc):
+        raise _INVALID_INVITE
+
+    # Binds the token to the specific email it was issued for. The token's
+    # own unguessability already limits who *can* redeem it, but without
+    # this check a leaked/forwarded link would let anyone sign up as any
+    # email under that org and role — this is what stops that.
+    if invite.email != email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invite was issued for a different email address",
+        )
+
+    # Marked accepted now, committed later alongside the User insert. Two
+    # concurrent redemptions of the same token would both pass this check
+    # before either commits, but both are necessarily creating the SAME
+    # email (just checked above) — the pre-existing `users.email` unique
+    # constraint is what actually stops the second one, surfacing as the
+    # ordinary "Email already in use" 409 a few lines down, not a new
+    # locking mechanism built for this.
+    invite.accepted_at = datetime.now(timezone.utc)
+    return invite.org_id, invite.role
 
 
 def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: str) -> None:
@@ -75,20 +127,25 @@ async def _issue_token_pair(
 async def signup(
     request: Request, payload: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)
 ) -> TokenPair:
-    # First user of a brand-new org: self-serve signup creates the workspace,
-    # same pattern as Slack/Linear/Notion onboarding. Joining an *existing*
-    # org (invite links) is a separate, not-yet-built flow.
-    org = Organization(name=payload.org_name)
-    db.add(org)
-    await db.flush()  # organizations has no RLS, so no tenant context needed yet
-
-    await set_tenant_context(db, org.id)
+    # Two paths sharing one endpoint. No invite_token: first user of a
+    # brand-new org, self-serve, same pattern as Slack/Linear/Notion
+    # onboarding — org_name is required (enforced in SignupRequest). A
+    # valid invite_token: join that invite's existing org, with that
+    # invite's role, instead — org_name is ignored.
+    if payload.invite_token:
+        org_id, role = await _redeem_invite(db, payload.invite_token, payload.email)
+    else:
+        org = Organization(name=payload.org_name)
+        db.add(org)
+        await db.flush()  # organizations has no RLS, so no tenant context needed yet
+        await set_tenant_context(db, org.id)
+        org_id, role = org.id, UserRole.ADMIN
 
     user = User(
-        org_id=org.id,
+        org_id=org_id,
         email=payload.email,
         hashed_password=hash_password(payload.password),
-        role=UserRole.ADMIN,
+        role=role,
     )
     db.add(user)
     try:
@@ -97,7 +154,7 @@ async def signup(
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already in use")
 
-    return await _issue_token_pair(response, user_id=user.id, org_id=org.id, role=user.role.value)
+    return await _issue_token_pair(response, user_id=user.id, org_id=org_id, role=user.role.value)
 
 
 @router.post("/login", response_model=TokenPair)

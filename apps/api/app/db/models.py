@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Enum, FetchedValue, ForeignKey, String, text
+from sqlalchemy import DateTime, Enum, FetchedValue, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -106,11 +106,16 @@ class Project(Base):
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
-    # RESTRICT, not CASCADE: deleting a user shouldn't silently wipe out
-    # every project they ever created. No user-deletion flow exists yet, so
-    # this is a forward-looking default, not a tested constraint.
-    created_by: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    # Nullable + SET NULL (migration 0008), not the RESTRICT this started
+    # as: member removal (see app/api/org.py) needs to actually delete a
+    # User row, and RESTRICT would block that deletion for anyone who ever
+    # created a project. A removed member's projects are kept — deleting
+    # someone's org access shouldn't silently destroy their work — just
+    # with an orphaned (NULL) creator reference. _require_owner_or_admin
+    # treats a NULL creator as "not mine," so an orphaned project falls
+    # back to admin-only edits, which is the right degraded state.
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     # server_onupdate (not server_default): this table has a BEFORE UPDATE
@@ -192,10 +197,89 @@ class Ticket(Base):
     # never require renumbering every other card in the column, which a
     # plain sequential integer position would need on most inserts.
     position: Mapped[float] = mapped_column(nullable=False)
-    created_by: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    # Same SET NULL reasoning as Project.created_by above (migration 0008).
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()
+    )
+
+
+class Invite(Base):
+    """A pending or accepted invitation for one email to join this org.
+
+    No eager_defaults: no column here is trigger-maintained (accepted_at is
+    set by application code — see app/api/auth.py — not a DB trigger), so
+    there's nothing async SQLAlchemy would need to re-fetch after a write.
+    """
+
+    __tablename__ = "invites"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    email: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(
+            UserRole,
+            name="user_role",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+    )
+    # Nullable + SET NULL: an admin who sent invites shouldn't become
+    # undeletable because of it — same reasoning as Project/Ticket.created_by.
+    invited_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Opaque random token (secrets.token_urlsafe, same as refresh tokens),
+    # not a JWT — see app/api/invites.py for the full reasoning. Unique so
+    # invite_lookup (below) and the redemption query can both trust a token
+    # resolves to exactly one row.
+    token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    # DateTime(timezone=True) spelled out explicitly here, unlike
+    # created_at/updated_at elsewhere in this file: those are always
+    # DB-computed (server_default/trigger), so the ORM never has to bind a
+    # Python datetime value into an INSERT for them, and Mapped[datetime]'s
+    # inferred (naive) column type never gets exercised. expires_at and
+    # accepted_at are the first columns actually set from Python-side
+    # datetime.now(timezone.utc) — without this, SQLAlchemy infers a plain
+    # naive TIMESTAMP for the bind parameter, mismatching the migration's
+    # real TIMESTAMP WITH TIME ZONE column and making asyncpg reject the
+    # tz-aware value outright ("can't subtract offset-naive and
+    # offset-aware datetimes"). Found by actually running this, not
+    # inspected for in advance.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+class InviteLookup(Base):
+    """token -> (org_id, invite_id) routing only, no RLS — same role as
+    UserLookup for login: redeeming an invite at signup has to find the
+    invite BEFORE any tenant context exists to scope an RLS-protected query
+    with. Kept in sync by a Postgres trigger on `invites` (migration 0007),
+    not application code, for the same reason UserLookup is. Deliberately
+    minimal: no email/role here, so a compromise of this table alone
+    reveals nothing but "this token belongs to this org," and possession of
+    the token itself is already the credential that matters.
+    """
+
+    __tablename__ = "invite_lookup"
+
+    token: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    invite_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("invites.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
     )

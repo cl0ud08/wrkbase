@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     # Comma-separated list of origins allowed to call this API from a browser.
     cors_origins: str = "http://localhost:3000"
 
+    # Kept distinct from cors_origins (a security allowlist that could
+    # legitimately hold several origins) even though they're the same
+    # value today: this one answers a different question — "where do I
+    # build a link that points back at the frontend" — for the invite
+    # link returned by POST /invites.
+    frontend_url: str = "http://localhost:3000"
+    invite_expire_days: int = 7
+
     # Connects as the least-privilege `wrkbase_app` role (see migration 0001),
     # never as the Postgres superuser used to run migrations.
     database_url: str

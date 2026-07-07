@@ -481,3 +481,85 @@ just-installed `dnd-kit` packages in the process — this is now a known
 two-step recovery (`--force-recreate -V`, then reinstall any packages
 added since the image was last built), not something to be surprised by
 again.
+
+---
+
+## Slice 10 — Team invites + member management
+
+**The actual gap being closed.** Every prior signup created a brand-new
+org — there was no way for a second person to join an *existing* one.
+**Built:** the `Invite`/`InviteLookup` models, migration 0007 (invites
+table + RLS + the lookup-table bootstrap pattern) and migration 0008 (a
+direct consequence of adding real member deletion —
+`projects.created_by`/`tickets.created_by` had to move from `RESTRICT`
+to nullable `SET NULL`), a second signup path that joins an existing org
+via an invite token, invite CRUD + a public preview endpoint, org-member
+list/role-change/removal endpoints with a last-admin-removal guard, a
+`/team` settings page, an invite-aware signup page, and
+`scripts/verify_invites_rls.py`.
+
+**Opaque token, not a JWT.** Every redemption already has to hit the
+database to check `accepted_at`/`expires_at` — business state a signed
+token can't safely carry, since there's no clean way to "revoke" a JWT
+short of a blocklist. An opaque token's entire security model is "look
+it up; found, unexpired, and unaccepted means valid," which is exactly
+the rule this feature needs, and it's trivially revocable by deleting
+the row. This isn't a new pattern — it's the same choice already made
+for refresh tokens back in Slice 3, reapplied rather than reinvented.
+
+**The bootstrap-lookup problem, solved the same way `user_lookup`
+already solved it.** Redeeming a token happens before any tenant context
+exists, but `invites` carries real RLS like every other org-scoped
+table. `invite_lookup` — a minimal, RLS-free `token → org_id` table kept
+in sync by an `AFTER INSERT` trigger — is structurally identical to how
+`user_lookup` lets login find an org before a tenant context can be set.
+Deliberately minimal: no email, no role, nothing worth stealing beyond
+what possessing the token itself already grants.
+
+**No composite FK on invites — checked, not assumed.** Tickets and
+workflow states needed composite FKs because they're scoped along *two*
+dimensions that could independently disagree (a real project_id from
+the *wrong* org). An invite is only ever org-scoped — one dimension,
+same shape as `users` or `projects` themselves — so a plain single-column
+`org_id` FK is the correct, sufficient guarantee. There's no second
+scope for it to drift out of sync with.
+
+**The last-admin-removal guard, generalized past the literal ask.** An
+org that reaches zero admins has no way back — every admin-gated action
+becomes permanently unreachable through the API. The brief specifically
+named blocking *removal* of the last admin, but demoting them away from
+`admin` has the exact same lockout failure mode, so both `DELETE
+/org/members/{id}` and `PATCH .../role` share one guard
+(`_ensure_not_last_admin`), not just the one path that was asked for.
+
+**What happens to a removed member's tickets and projects.** Kept, not
+deleted, with `created_by` set to `NULL` (migration 0008). The
+alternative — cascading the delete — would silently destroy a departed
+teammate's entire work history over an org-membership change, which is
+a far more surprising and destructive default than losing attribution.
+`_require_owner_or_admin` already treats a `NULL` creator as "not mine,"
+so an orphaned resource correctly falls back to admin-only edits with no
+extra code.
+
+**An acknowledged gap, flagged rather than silently shipped or silently
+fixed.** A removed member's still-live access token isn't revoked — it
+simply expires naturally within 15 minutes, since there's no reverse
+index today from `user_id` to that user's outstanding Redis
+refresh-token keys to walk and delete. Worth closing later; genuinely
+out of scope for this slice.
+
+**Two real bugs, found by actually running it, not caught by review.**
+`Invite.expires_at`/`accepted_at` are the first columns in this codebase
+where a Python-computed, timezone-aware `datetime` gets bound directly
+into an `INSERT` — every other timestamp column is DB-computed via
+`server_default`/a trigger, so this exact failure mode never had a
+chance to surface before. `Mapped[datetime]` alone infers a naive
+column type, which asyncpg flatly rejected against the migration's real
+`TIMESTAMP WITH TIME ZONE` column ("can't subtract offset-naive and
+offset-aware datetimes") — fixed by declaring `DateTime(timezone=True)`
+explicitly on both columns. Separately, refactoring `signup()` to branch
+on an invite token left a stale reference to the old `org` variable in
+the final `_issue_token_pair` call, an `UnboundLocalError` on the
+invite-redemption path specifically (the new-org path never touched that
+line). Both were caught by actually exercising the endpoints in Docker
+before writing the proof script, not by inspection.

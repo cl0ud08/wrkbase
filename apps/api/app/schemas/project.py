@@ -23,6 +23,8 @@ class ProjectRead(BaseModel):
     org_id: uuid.UUID
     name: str
     description: str | None
-    created_by: uuid.UUID
+    # Nullable: a removed member's projects are kept, not deleted, with
+    # created_by set to NULL (migration 0008) — see app/api/org.py.
+    created_by: uuid.UUID | None
     created_at: datetime
     updated_at: datetime

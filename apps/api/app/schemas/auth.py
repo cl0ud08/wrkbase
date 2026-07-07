@@ -1,8 +1,14 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 class SignupRequest(BaseModel):
-    org_name: str = Field(min_length=1)
+    # Both optional at the field level; the validator below enforces the
+    # real either/or rule. Two genuinely different signup paths share one
+    # endpoint: no invite_token creates a brand-new org (org_name required),
+    # a valid invite_token joins that invite's existing org instead
+    # (org_name ignored — the org is whatever the invite says).
+    org_name: str | None = Field(default=None, min_length=1)
+    invite_token: str | None = None
     email: EmailStr
     password: str = Field(min_length=8)
 
@@ -13,6 +19,12 @@ class SignupRequest(BaseModel):
         # normalizing case, "Alice@Acme.test" at signup and "alice@acme.test"
         # at login would be treated as two different, non-matching values.
         return value.lower()
+
+    @model_validator(mode="after")
+    def require_org_name_without_invite(self) -> "SignupRequest":
+        if not self.invite_token and not self.org_name:
+            raise ValueError("org_name is required when signing up without an invite token")
+        return self
 
 
 class LoginRequest(BaseModel):

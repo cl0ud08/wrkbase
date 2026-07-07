@@ -63,12 +63,20 @@ export default function DashboardPage() {
             <p className="text-sm text-zinc-500 dark:text-zinc-500">{user.orgName}</p>
           )}
         </div>
-        <button
-          onClick={() => setShowForm((v) => !v)}
-          className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
-        >
-          {showForm ? "Cancel" : "New project"}
-        </button>
+        <div className="flex gap-3">
+          <a
+            href="/team"
+            className="rounded-full border border-black/[.08] px-5 py-2 text-sm font-medium transition-colors hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+          >
+            Team
+          </a>
+          <button
+            onClick={() => setShowForm((v) => !v)}
+            className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+          >
+            {showForm ? "Cancel" : "New project"}
+          </button>
+        </div>
       </div>
 
       {showForm && (
@@ -115,9 +123,10 @@ export default function DashboardPage() {
           </p>
         )}
         {projects?.map((project) => (
-          <div
+          <a
             key={project.id}
-            className="rounded-xl border border-black/[.08] p-4 dark:border-white/[.145]"
+            href={`/projects/${project.id}`}
+            className="rounded-xl border border-black/[.08] p-4 transition-colors hover:bg-black/[.03] dark:border-white/[.145] dark:hover:bg-white/[.05]"
           >
             <h2 className="font-medium text-black dark:text-zinc-50">{project.name}</h2>
             {project.description && (
@@ -125,7 +134,7 @@ export default function DashboardPage() {
                 {project.description}
               </p>
             )}
-          </div>
+          </a>
         ))}
       </div>
     </div>
