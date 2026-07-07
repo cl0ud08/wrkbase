@@ -5,13 +5,29 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
-from app.db.models import Project, UserRole
+from app.db.models import Project, UserRole, WorkflowState
 from app.db.session import get_db
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectUpdate
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+# (name, order, is_default). Seeded here, in the endpoint, not via a DB
+# trigger like user_lookup's sync: this is product/template configuration
+# (names, ordering, which column is "default") rather than a structural
+# invariant — the kind of thing likely to become per-org or per-template
+# configurable later, which is a Python branch to add here but would mean
+# rewriting trigger SQL there. Projects also have exactly one creation
+# path today (this endpoint), so a trigger's "can't be forgotten across
+# many writers" guarantee — the reason user_lookup needed one — isn't
+# buying much yet either.
+_DEFAULT_WORKFLOW_STATES = [
+    ("Backlog", 0, True),
+    ("In Progress", 1, False),
+    ("Review", 2, False),
+    ("Done", 3, False),
+]
 
 
 async def _get_project_or_404(db: AsyncSession, project_id: uuid.UUID) -> Project:
@@ -50,6 +66,15 @@ async def create_project(
         created_by=auth.user_id,
     )
     db.add(project)
+    await db.flush()  # populate project.id for the workflow states below
+
+    for name, order, is_default in _DEFAULT_WORKFLOW_STATES:
+        db.add(
+            WorkflowState(
+                org_id=auth.org_id, project_id=project.id, name=name, order=order, is_default=is_default
+            )
+        )
+
     await db.commit()
     return project
 

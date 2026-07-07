@@ -15,6 +15,13 @@ class UserRole(str, enum.Enum):
     VIEWER = "viewer"
 
 
+class TicketType(str, enum.Enum):
+    EPIC = "epic"
+    STORY = "story"
+    TASK = "task"
+    SUBTASK = "subtask"
+
+
 class Organization(Base):
     __tablename__ = "organizations"
 
@@ -111,6 +118,84 @@ class Project(Base):
     # Without this marker SQLAlchemy has no way to know the trigger changed
     # the row, and the in-memory object would show a stale timestamp after
     # commit until something explicitly re-fetched it.
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=text("now()"), server_onupdate=FetchedValue()
+    )
+
+
+class WorkflowState(Base):
+    """A board column (Backlog/In Progress/... ) for one project.
+
+    No updated_at, deliberately: the contract for this table (see the
+    Pydantic schema) has no trigger-maintained column, so there's nothing
+    for eager_defaults to fix here — added reflexively it would just be
+    dead weight. Reorders go through `order` (a plain client-supplied
+    int), not a server-side timestamp.
+    """
+
+    __tablename__ = "workflow_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    # No single-column FK on org_id/project_id — same reasoning as Ticket:
+    # the real constraint is the composite (project_id, org_id) FK in
+    # migration 0006, so a plain single-column marker here would describe
+    # a weaker guarantee than what's actually enforced.
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    order: Mapped[int] = mapped_column(nullable=False)
+    is_default: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+    # Applied proactively this time — this is exactly the Projects-slice
+    # eager_defaults/MissingGreenlet lesson (see Project above), not
+    # rediscovered here. See migration 0005 for the matching trigger.
+    __mapper_args__ = {"eager_defaults": True}
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    # No single-column ForeignKey() markers on org_id/project_id/parent_id:
+    # the real constraints are the composite ones in migration 0005
+    # (project_id+org_id must match a real project in that org; parent_id+
+    # project_id must match a real ticket in the same project). A plain
+    # single-column FK here would describe a weaker guarantee than what's
+    # actually enforced.
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    type: Mapped[TicketType] = mapped_column(
+        Enum(
+            TicketType,
+            name="ticket_type",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Replaces the fixed status enum from the tickets slice: the workflow
+    # is now per-project configurable state rows (migration 0006), not a
+    # hardcoded todo/in_progress/done. No single-column FK here either —
+    # same composite-FK reasoning as parent_id (must be a state in this
+    # same project, not just any state in the org).
+    workflow_state_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Fractional/"gap" index for ordering within a column: new cards get
+    # max(position in that column) + 1024, and dropping a card between two
+    # others computes the midpoint of their positions. Both are O(1) and
+    # never require renumbering every other card in the column, which a
+    # plain sequential integer position would need on most inserts.
+    position: Mapped[float] = mapped_column(nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()
     )

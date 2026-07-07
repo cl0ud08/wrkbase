@@ -1,0 +1,53 @@
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.db.models import TicketType
+
+
+class TicketCreate(BaseModel):
+    parent_id: uuid.UUID | None = None
+    type: TicketType
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    # None = the project's default workflow state / appended to the end of
+    # that column — the endpoint fills both in when omitted.
+    workflow_state_id: uuid.UUID | None = None
+    position: float | None = None
+
+
+class TicketUpdate(BaseModel):
+    # PATCH semantics via exclude_unset in the endpoint, same as Project.
+    parent_id: uuid.UUID | None = None
+    type: TicketType | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    workflow_state_id: uuid.UUID | None = None
+    position: float | None = None
+
+
+class TicketRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    project_id: uuid.UUID
+    parent_id: uuid.UUID | None
+    type: TicketType
+    title: str
+    description: str | None
+    workflow_state_id: uuid.UUID
+    position: float
+    # Nullable: a removed member's tickets are kept, not deleted, with
+    # created_by set to NULL (migration 0008) — see app/api/org.py.
+    created_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TicketTreeNode(TicketRead):
+    children: list["TicketTreeNode"] = Field(default_factory=list)
+
+
+TicketTreeNode.model_rebuild()

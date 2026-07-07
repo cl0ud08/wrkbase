@@ -341,3 +341,143 @@ ran. That's the actual payoff of Phase 0's RLS investment: a new resource
 type inherits tenant isolation for free just by using the existing
 dependency — the one real friction point was an async-ORM/trigger
 interaction, not the tenancy model itself.
+
+---
+
+## Slice 8 — Ticket CRUD (epic → story/task → subtask hierarchy)
+
+**Built:** the `Ticket` model, migration 0005 (table + RLS in the same
+migration), full CRUD scoped to a project
+(`POST`/`GET`/`GET one`/`PATCH`/`DELETE /projects/{id}/tickets`), a
+nested `GET /tickets/tree` endpoint, the subtask-parent-type business
+rule, `scripts/verify_tickets_rls.py`, and a flat ticket list on the
+frontend (later replaced by the Kanban board in Slice 9).
+
+**`eager_defaults` applied proactively this time, and confirmed not
+needed the hard way.** Slice 7 hit the async-SQLAlchemy
+`MissingGreenlet` crash on `Project`'s first real UPDATE and had to
+diagnose it after the fact. `Ticket` has the identical shape — a
+trigger-maintained `updated_at` — so `__mapper_args__ = {"eager_defaults":
+True}` went on the model from the start this time, not after a 500.
+`verify_tickets_rls.py`'s creator-edit check exists specifically to prove
+that: it passes clean on the first run, with no crash to rediscover.
+
+**Composite FKs, reapplied without re-explaining them from scratch.**
+Tickets are scoped along two dimensions that can disagree — `project_id`
+and `org_id` — so `(project_id, org_id) → projects(id, org_id)` is a
+composite FK, not a plain one, same reasoning as the RLS-isn't-enough
+gap it closes. Tickets also self-reference via `parent_id`, which needs
+the same treatment one level deeper: `(parent_id, project_id) →
+tickets(id, project_id)`, so a subtask's parent can't silently be a real
+ticket from a *different* project in the same org. Both need their own
+supporting `UNIQUE(id, org_id)` / `UNIQUE(id, project_id)` constraint on
+the referenced side before Postgres will accept them.
+
+**Where the subtask-parent-type rule lives, and why.** A subtask's
+parent must be a story or task, never an epic or another subtask. This
+is enforced in `app/api/tickets.py`, not as a DB constraint — it's a
+type-conditional business rule, not a tenant/scope boundary (RLS and the
+composite FKs already own that), and it needs a clean 422 with a real
+message rather than a raw constraint-violation error. It's also the kind
+of rule likely to evolve once workflow rules become more configurable,
+which is much cheaper to change in Python than in a `CHECK` constraint
+or trigger.
+
+**A FastAPI route-ordering gotcha.** `/tickets/tree` has to be declared
+*before* `/tickets/{ticket_id}` — FastAPI matches routes in declaration
+order, and the literal string `"tree"` matches a plain `{ticket_id}`
+path parameter just fine at the routing layer; the failed `UUID`
+coercion only happens *after* a route is matched, not during matching.
+Declared the other way around, `GET /tickets/tree` would 422 as an
+invalid ticket id instead of ever reaching the tree handler.
+
+**The tree built once, server-side, not left for every client to
+re-derive.** `GET /tickets/tree` groups a project's flat ticket list
+into `epic → story/task → subtask` nesting in one O(n) pass over data
+already fetched in a single query, and ships the nested shape directly.
+The alternative — shipping the flat list and letting each client
+(today's web frontend, anything else later) walk `parent_id` chains
+itself — means as many places to get the grouping logic right as there
+are clients, for a computation that's trivial to centralize.
+
+---
+
+## Slice 9 — Kanban board with configurable workflow states
+
+**Built:** the `WorkflowState` model, migration 0006 (new table + RLS +
+a real data migration that backfills default states for every existing
+project, remaps `tickets.status` to `workflow_state_id`, and drops the
+old status enum entirely), workflow-state CRUD endpoints, default-state
+seeding on project creation, a move-ticket path
+(`workflow_state_id`/`position` via the existing `PATCH /tickets/{id}`),
+a full drag-and-drop board (dnd-kit) on the frontend, a basic settings
+page for reordering/renaming states, and
+`scripts/verify_workflow_rls.py`.
+
+**`eager_defaults` correctly *not* applied — a real "no," not a reflex
+"yes."** Unlike `Project`/`Ticket`, `WorkflowState` has no
+trigger-maintained column (no `updated_at` in this table's contract —
+reorders go through a plain client-supplied `order` int, not a
+server-side timestamp). Adding `eager_defaults` anyway, out of habit
+from the last two slices, would've been dead weight with nothing to fix.
+The right call here was recognizing the earlier lesson didn't apply, not
+reapplying it unconditionally.
+
+**Composite FK, reapplied a third time — plus a third layer.**
+`workflow_states.project_id` gets the same `(project_id, org_id) →
+projects(id, org_id)` treatment as tickets, for the same reason. Tickets
+then gained a *third* composite FK on top of the two from Slice 8:
+`(workflow_state_id, project_id) → workflow_states(id, project_id)`, so
+a ticket can't be moved into a workflow state that's real but belongs to
+a different project in the same org.
+
+**Where default-state seeding lives — a genuine judgment call, not a
+copy of the `user_lookup` trigger pattern.** New projects get four
+default states (`Backlog`/`In Progress`/`Review`/`Done`) seeded in the
+`create_project` endpoint itself, not via a DB trigger. This is the
+opposite choice from `user_lookup`, deliberately: trigger-based sync
+earns its keep when an invariant must hold no matter which of *several*
+code paths writes the parent row (users get created by signup, seed
+scripts, and future admin tooling alike). Projects have exactly one
+creation path today, so that guarantee isn't buying much yet, while
+seeding logic here is product/template configuration (names, ordering,
+which column is default) that's realistically going to become
+per-org/per-template configurable later — a Python branch to change,
+versus rewriting trigger SQL.
+
+**The move-vs-edit authorization split.** Dragging a card
+(`workflow_state_id`/`position` only) is open to any org member; editing
+what a ticket actually says stays creator-or-admin, same as Projects.
+Restricting drag-and-drop to a ticket's creator would mean only the
+person who filed a card could ever move it to Done, which breaks the
+basic point of a shared board. A request that touches both a move field
+and a content field is treated as a content edit — the stricter rule
+wins.
+
+**The one real dnd-kit gotcha.** `SortableContext` only creates drop
+targets for existing sortable *items*, so a column with zero cards had
+nothing to catch a dropped card until `useDroppable` was added to the
+column container itself, independent of the cards inside it. Both are
+needed together — `SortableContext` for reordering within/between
+non-empty columns, `useDroppable` so an empty column is a valid drop
+target at all.
+
+**Built plain first, then made optimistic, on purpose.** The board
+worked end-to-end over real HTTP (drag → `PATCH` → refetch, no
+client-side move before the server confirms) before any optimistic
+update was added, so a failure would be easy to isolate to either layer.
+The optimistic version snapshots ticket state before applying a local
+move, and only restores that snapshot if the `PATCH` comes back
+non-`ok` — rollback-on-failure, not a full reload, since the point of
+optimism is to avoid the round-trip latency in the first place.
+
+**A Docker anonymous-volume gotcha, hit for the first time here.** A new
+page route (the settings page) 404'd even after a plain container
+restart — Turbopack's route-manifest cache persists in the `.next`
+anonymous volume, which `docker compose restart` doesn't clear. Fixed
+with `docker compose up -d --force-recreate -V web`. That flag also
+renews the `node_modules` anonymous volume, which silently deleted the
+just-installed `dnd-kit` packages in the process — this is now a known
+two-step recovery (`--force-recreate -V`, then reinstall any packages
+added since the image was last built), not something to be surprised by
+again.
