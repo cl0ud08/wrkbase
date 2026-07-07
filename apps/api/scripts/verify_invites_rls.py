@@ -63,6 +63,7 @@ async def main() -> None:
         resp_b = await signup(client, f"admin-b-{suffix}@example.dev", org_name=f"Org B {suffix}")
         resp_b.raise_for_status()
         token_b = resp_b.json()["access_token"]
+        refresh_admin_b = resp_b.json()["refresh_token"]
         me_b = await me(client, token_b)
         org_b_id = me_b["org_id"]
         print("PASS: two independent orgs set up, each with one admin")
@@ -136,6 +137,7 @@ async def main() -> None:
         )
         member_join_resp.raise_for_status()
         token_member_b = member_join_resp.json()["access_token"]
+        refresh_member_b = member_join_resp.json()["refresh_token"]
         me_member_b = await me(client, token_member_b)
         assert me_member_b["role"] == "member"
 
@@ -176,11 +178,35 @@ async def main() -> None:
             f"/org/members/{member_b_id}", json={"role": "admin"}, headers=auth_headers(token_b)
         )
         promote_resp.raise_for_status()
+
+        # --- a role change takes effect on the NEXT refresh, not just re-login
+        # member_b's refresh token was issued at signup, before this
+        # promotion, with role="member" baked into its Redis payload. If
+        # /auth/refresh trusted that cached value, this would still come
+        # back "member" — it has to re-check the DB to see "admin" here.
+        refreshed_after_promotion = await client.post(
+            "/auth/refresh", json={"refresh_token": refresh_member_b}
+        )
+        refreshed_after_promotion.raise_for_status()
+        me_after_promotion = await me(client, refreshed_after_promotion.json()["access_token"])
+        assert me_after_promotion["role"] == "admin", (
+            "refresh should reflect the freshly-promoted role, not a stale cached one"
+        )
+        print("PASS: refreshing with a pre-promotion token reflects the new role, not the stale one")
+
         now_allowed_delete = await client.delete(
             f"/org/members/{admin_b_id}", headers=auth_headers(token_b)
         )
         assert now_allowed_delete.status_code == 204, f"expected 204, got {now_allowed_delete.status_code}"
         print("PASS: once a second admin exists, removing the original admin succeeds")
+
+        # --- a removed member's outstanding refresh token stops working ------
+        # admin_b's original refresh token (from signup, never used since)
+        # should have been revoked as part of the DELETE above — not just
+        # left to expire naturally over the next 7 days.
+        revoked_refresh = await client.post("/auth/refresh", json={"refresh_token": refresh_admin_b})
+        assert revoked_refresh.status_code == 401, f"expected 401, got {revoked_refresh.status_code}"
+        print("PASS: a removed member's outstanding refresh token is revoked, not left valid")
 
         # --- cross-org isolation on invites ----------------------------------
         cross_delete = await client.delete(

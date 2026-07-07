@@ -8,6 +8,7 @@ from app.api.deps import AuthContext, get_current_auth
 from app.db.models import User, UserRole
 from app.db.session import get_db
 from app.schemas.member import MemberRead, MemberUpdate
+from app.services.refresh_tokens import revoke_all_refresh_tokens_for_user
 
 router = APIRouter(prefix="/org", tags=["org"])
 
@@ -100,11 +101,17 @@ async def remove_member(
 
     # Projects/tickets this member created are kept, not deleted — see
     # migration 0008 and Project/Ticket.created_by in app/db/models.py.
-    # user_lookup cascades automatically (ON DELETE CASCADE). Any still-
-    # live access/refresh tokens for this user are NOT revoked here —
-    # acknowledged gap: the access token (stateless JWT) simply expires
-    # naturally within 15 minutes, and there's no reverse index from
-    # user_id to their outstanding Redis refresh-token keys today to walk
-    # and delete. Worth closing later; out of scope for this slice.
+    # user_lookup cascades automatically (ON DELETE CASCADE).
     await db.delete(member)
     await db.commit()
+
+    # Closes the "removed but still has a working session indefinitely"
+    # gap: every outstanding refresh token for this user is killed, so
+    # they can't silently mint fresh access tokens after this point. Done
+    # AFTER the commit, not before: if the commit had failed, revoking
+    # their sessions first would've locked out someone who's actually
+    # still a legitimate member. Their current access token (if any) is a
+    # separate, smaller residual gap — a stateless JWT with no server-side
+    # record to delete, so it simply expires naturally within its 15-
+    # minute lifetime.
+    await revoke_all_refresh_tokens_for_user(member.id)

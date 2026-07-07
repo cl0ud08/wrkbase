@@ -31,7 +31,7 @@ async def main() -> None:
             user = User(
                 org_id=org.id,
                 email=org_spec["user_email"],
-                hashed_password=hash_password(SEED_PASSWORD),
+                hashed_password=await hash_password(SEED_PASSWORD),
                 role=UserRole.ADMIN,
             )
             session.add(user)

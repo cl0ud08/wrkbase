@@ -592,3 +592,112 @@ from cross-talking on a budget that only exists because of how CI
 happens to run them in sequence. Verified by actually running all six
 scripts back-to-back locally with the same resets CI now uses, with no
 artificial waits, before trusting the CI YAML to work.
+
+---
+
+## Slice 12 — Hardening the invites/auth slice: two real bugs, one of
+them a genuine authorization vulnerability
+
+Team invites + member management (Slice 10) was manually verified end to
+end — including the session-revocation behavior below — before this
+slice closes it out. This slice is a distinct, later pass: going back
+over the auth path Slice 10 touched and asking "is this actually safe,"
+not part of the original build.
+
+**Closing Slice 10's own acknowledged gap: a removed member's refresh
+tokens are now revoked.** Slice 10 shipped with this explicitly flagged
+as out of scope — a removed member's outstanding refresh token was left
+to expire naturally over its full 7-day lifetime, meaning they could
+keep minting fresh 15-minute access tokens for up to a week after being
+removed. Closed with a reverse index in Redis
+(`refresh_tokens_by_user:{user_id}`, a set of that user's live tokens,
+maintained alongside the existing per-token keys and TTL-refreshed on
+every new token issued) — `DELETE /org/members/{id}` now walks that set
+and kills every outstanding token for the removed user in one shot. The
+set can hold a few already-expired token strings between refreshes
+(Redis key expiry doesn't fire a callback to clean up a set that
+references it), which is harmless: deleting an already-gone key is a
+no-op, not an error.
+
+**Argon2 was blocking the event loop — found in an earlier code review,
+fixed now.** `hash_password`/`verify_password` were synchronous calls
+made directly inside async route handlers. Argon2 is deliberately slow
+and memory-hard (the entire point of it as a password hash), so calling
+it un-awaited on the event loop blocks every other concurrent request
+being served by that worker for the duration — this was observed
+firsthand as `/health` hanging for 10+ seconds under load during earlier
+testing. Fixed by making both functions `async` and wrapping the
+argon2-cffi calls in `starlette.concurrency.run_in_threadpool` —
+**inside `security.py` itself, not at the call sites**, so the fix can't
+be silently undone by some future caller forgetting to wrap it. Also
+widened `verify_password`'s exception handling from just
+`VerifyMismatchError` (wrong password — the expected case) to also
+catch `VerificationError`/`InvalidHashError` (a malformed or corrupted
+stored hash), so that case fails closed as "not verified" instead of
+propagating as an unhandled 500 — the same default-deny instinct behind
+RLS: an ambiguous auth state should never resolve to "let them in," and
+it shouldn't crash the request either.
+
+**The important one: `POST /auth/refresh` was trusting a stale, cached
+role instead of re-checking the database — a real authorization bug,
+not a style nit.** This was found by accident, while wiring up the
+token-revocation fix above: tracing through what data `refresh()`
+actually used to reissue an access token revealed it never touched the
+database at all. A refresh token's Redis payload stores the user's role
+*at the moment it was issued* (`{"user_id":..., "org_id":..., "role":
+...}`), and `refresh()` was reading `role` straight out of that cached
+payload — then, because every rotation calls `store_refresh_token` with
+that same `role` value, the stale role got faithfully copied forward
+into the *next* token's payload too, on every single refresh, forever.
+
+**Why this matters more than it might look at first.** Access tokens
+already carry an accepted, bounded staleness window — a JWT is valid for
+15 minutes no matter what changes server-side in the meantime, and
+that's a deliberate, documented tradeoff of stateless tokens. This bug
+was different in kind, not degree: refreshing is the mechanism that's
+*supposed* to bring a session back in line with reality every 15
+minutes, and it wasn't. Concretely — an org admin uses `PATCH
+/org/members/{id}` to demote a compromised or departing admin down to
+`member`. Their current access token still has 15 minutes of admin
+rights left, which is expected and fine. But the moment that token
+expires, their browser silently calls `/auth/refresh` — and the old code
+would hand back a **brand new access token with `role: "admin"` again**,
+read straight from the stale refresh-token payload, with no database
+check in between. As long as they kept using the app (refreshing every
+~15 minutes, same as any normal active session), they would have kept
+their admin privileges **indefinitely** — the demotion would never
+actually take effect until they explicitly logged out and back in, which
+nothing in the product prompts anyone to do. That's a real privilege-
+persistence vulnerability: an authorization decision made by an admin
+through the UI silently failing to apply to an already-issued session.
+
+**The fix.** `refresh()` now does exactly what `login()` already does a
+few lines above it in the same file: `set_tenant_context` using the
+`org_id` from the refresh token payload (that part's still trusted — it
+doesn't change on a role edit), then a real `SELECT` against `users` for
+the *current* role, through the same RLS-protected path every other
+query in this app goes through. If the user no longer exists (e.g. the
+revocation above somehow didn't catch them — belt and suspenders), the
+refresh is rejected outright. The staleness window for a role change is
+now bounded by the same 15 minutes as everything else in this system,
+not "however long the user keeps using the app."
+
+**Verified, not just fixed.** `verify_invites_rls.py` gained two new
+checks specifically for this pass: refreshing with a token issued
+*before* a promotion now correctly comes back with the *new* role, and a
+removed member's original refresh token is rejected with `401` rather
+than silently honored. Both fail against the old code and pass against
+the new code — confirmed by running them, not inferred from reading the
+diff. All six proof scripts were re-run together afterward with no
+regressions.
+
+**One more thing checked, not assumed: does a `NULL` `created_by` (a
+removed member's old tickets, from Slice 10's `SET NULL` migration)
+render sensibly on the board?** Checked by grepping the actual frontend
+rather than guessing — `createdBy` is referenced only in `lib/types.ts`
+(the type definitions and API-response mappers); it is never rendered
+anywhere in the UI. The Kanban card shows only a ticket's type and
+title, and there's no ticket detail view yet. So there's nothing to
+break — not because `NULL` is handled gracefully, but because the field
+isn't surfaced in the UI at all yet, a pre-existing gap rather than a
+new one this migration introduced.

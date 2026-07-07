@@ -144,7 +144,7 @@ async def signup(
     user = User(
         org_id=org_id,
         email=payload.email,
-        hashed_password=hash_password(payload.password),
+        hashed_password=await hash_password(payload.password),
         role=role,
     )
     db.add(user)
@@ -181,14 +181,19 @@ async def login(
     await set_tenant_context(db, lookup.org_id)
     user_result = await db.execute(select(User).where(User.id == lookup.user_id))
     user = user_result.scalar_one_or_none()
-    if user is None or not verify_password(payload.password, user.hashed_password):
+    if user is None or not await verify_password(payload.password, user.hashed_password):
         raise _INVALID_CREDENTIALS
 
     return await _issue_token_pair(response, user_id=user.id, org_id=user.org_id, role=user.role.value)
 
 
 @router.post("/refresh", response_model=TokenPair)
-async def refresh(request: Request, response: Response, payload: RefreshRequest | None = None) -> TokenPair:
+async def refresh(
+    request: Request,
+    response: Response,
+    payload: RefreshRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> TokenPair:
     # Browser clients never see the raw refresh token (httpOnly cookie); the
     # browser just sends the cookie automatically. Bearer-token clients pass
     # it explicitly in the body instead.
@@ -202,17 +207,36 @@ async def refresh(request: Request, response: Response, payload: RefreshRequest 
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
         )
 
+    org_id = uuid.UUID(data["org_id"])
+    user_id = uuid.UUID(data["user_id"])
+
+    # Re-check the user's CURRENT role from the database rather than
+    # trusting the role cached in the refresh token's own payload. Found
+    # while wiring up member-removal token revocation: role is baked into
+    # a refresh token at issuance and carried forward unchanged on every
+    # rotation (store_refresh_token below re-persists whatever role this
+    # call returns), so trusting the cached value would mean a role change
+    # via PATCH /org/members/{id} never actually takes effect for that
+    # user's existing session — a demoted admin would keep refreshing
+    # with admin privileges indefinitely, not just for the already-
+    # accepted 15-minute access-token window. This also gives removal a
+    # second layer of defense: if a refresh token somehow outlived
+    # revoke_all_refresh_tokens_for_user, the user row is simply gone from
+    # this query and the refresh is rejected here too.
+    await set_tenant_context(db, org_id)
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
+        )
+
     # Rotation: the old token was already deleted by pop_refresh_token above
     # (single-use). A stolen-but-unused refresh token is only ever valid
     # until the legitimate user's next normal refresh — which happens every
     # ~15 minutes as access tokens expire — not for its full multi-day
     # lifetime the way an unrotated long-lived token would be.
-    return await _issue_token_pair(
-        response,
-        user_id=uuid.UUID(data["user_id"]),
-        org_id=uuid.UUID(data["org_id"]),
-        role=data["role"],
-    )
+    return await _issue_token_pair(response, user_id=user_id, org_id=org_id, role=user.role.value)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
