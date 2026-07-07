@@ -53,7 +53,10 @@ services:
   web:
     build: ./apps/web
     environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      # Server-side only (no NEXT_PUBLIC_ prefix): used by next.config.ts's
+      # rewrite proxy, which runs inside this container, so it needs the
+      # internal docker-network address, not the host-mapped API_PORT.
+      API_INTERNAL_URL: http://api:8000
     ports:
       - "${WEB_PORT}:3000"
     volumes:

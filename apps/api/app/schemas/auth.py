@@ -26,11 +26,14 @@ class LoginRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    # Optional: the browser flow relies on the httpOnly refresh_token cookie
+    # instead (see app/api/auth.py), since client-side JS never has the
+    # value to put in a body. Bearer-token API clients still send it here.
+    refresh_token: str | None = None
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str | None = None
 
 
 class TokenPair(BaseModel):

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
+    @property
+    def cookie_secure(self) -> bool:
+        # Local dev runs over plain http; a `Secure` cookie would never be
+        # sent back by the browser at all. Real deploys must be https.
+        return self.environment != "development"
+
     class Config:
         env_file = ".env"
 

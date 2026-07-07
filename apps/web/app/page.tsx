@@ -1,50 +1,67 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
-type HealthState =
-  | { status: "loading" }
-  | { status: "ok"; service: string }
-  | { status: "error"; message: string };
+import { useAuth } from "../lib/auth-context";
 
 export default function Home() {
-  const [health, setHealth] = useState<HealthState>({ status: "loading" });
+  const { user, loading, logout } = useAuth();
+  const router = useRouter();
 
-  useEffect(() => {
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-
-    fetch(`${apiUrl}/health`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`API responded with ${res.status}`);
-        return res.json();
-      })
-      .then((data) => setHealth({ status: "ok", service: data.service }))
-      .catch((err) =>
-        setHealth({ status: "error", message: err.message as string }),
-      );
-  }, []);
+  async function handleLogout() {
+    await logout();
+    router.push("/login");
+  }
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-6 bg-zinc-50 font-sans dark:bg-black">
       <h1 className="text-3xl font-semibold tracking-tight text-black dark:text-zinc-50">
         Wrkbase
       </h1>
-      <div className="flex items-center gap-2 rounded-full border border-black/[.08] px-4 py-2 text-sm dark:border-white/[.145]">
-        <span
-          className={`h-2 w-2 rounded-full ${
-            health.status === "ok"
-              ? "bg-green-500"
-              : health.status === "error"
-                ? "bg-red-500"
-                : "bg-zinc-400 animate-pulse"
-          }`}
-        />
-        {health.status === "loading" && <span>Checking API...</span>}
-        {health.status === "ok" && <span>API is up ({health.service})</span>}
-        {health.status === "error" && (
-          <span>API unreachable: {health.message}</span>
-        )}
-      </div>
+
+      {loading && (
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">Loading...</p>
+      )}
+
+      {!loading && user && (
+        <div className="flex flex-col items-center gap-3">
+          <p className="text-sm text-zinc-700 dark:text-zinc-300">
+            Signed in as <span className="font-medium">{user.email}</span> —{" "}
+            {user.orgName}
+          </p>
+          <div className="flex gap-3">
+            <a
+              href="/dashboard"
+              className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+            >
+              Go to dashboard
+            </a>
+            <button
+              onClick={handleLogout}
+              className="rounded-full border border-black/[.08] px-5 py-2 text-sm font-medium transition-colors hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+            >
+              Log out
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!loading && !user && (
+        <div className="flex gap-3">
+          <a
+            href="/signup"
+            className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+          >
+            Sign up
+          </a>
+          <a
+            href="/login"
+            className="rounded-full border border-black/[.08] px-5 py-2 text-sm font-medium transition-colors hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+          >
+            Log in
+          </a>
+        </div>
+      )}
     </div>
   );
 }
