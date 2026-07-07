@@ -5,8 +5,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from slowapi.util import get_remote_address
+
 from app.api.deps import AuthContext, get_current_auth
 from app.core.config import settings
+from app.core.rate_limit import limiter
 from app.core.security import create_access_token, generate_refresh_token, hash_password, verify_password
 from app.db.models import Organization, User, UserLookup, UserRole
 from app.db.session import get_db, set_tenant_context
@@ -61,8 +64,12 @@ async def _issue_token_pair(
 
 
 @router.post("/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
+# Always keyed by IP regardless of any stray cookie — signup/login are the
+# endpoints most likely to be brute-forced, and the whole allowance should
+# be tied to the caller's network origin, not an identity they don't have yet.
+@limiter.limit("10/minute", key_func=get_remote_address)
 async def signup(
-    payload: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)
+    request: Request, payload: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)
 ) -> TokenPair:
     # First user of a brand-new org: self-serve signup creates the workspace,
     # same pattern as Slack/Linear/Notion onboarding. Joining an *existing*
@@ -90,8 +97,9 @@ async def signup(
 
 
 @router.post("/login", response_model=TokenPair)
+@limiter.limit("10/minute", key_func=get_remote_address)
 async def login(
-    payload: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)
+    request: Request, payload: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)
 ) -> TokenPair:
     # Step 1: user_lookup has no RLS, so this is the one query in the app
     # allowed to run with no tenant context set — answering "which org" is a
