@@ -70,15 +70,25 @@ correctly, not just each independently correct.
 docker compose exec api python -m scripts.seed
 docker compose exec api python -m scripts.verify_rls
 docker compose exec api python -m scripts.verify_auth_rls
+docker compose exec api python -m scripts.verify_projects_rls
+docker compose exec api python -m scripts.verify_tickets_rls
+docker compose exec api python -m scripts.verify_workflow_rls
+docker compose exec api python -m scripts.verify_invites_rls
 ```
 
 `verify_rls.py` proves default-deny (no tenant context → zero rows),
 strict cross-org isolation, and that a cross-tenant write is rejected —
-directly against Postgres. `verify_auth_rls.py` proves the same thing end
-to end over real HTTP: two orgs sign up, log in, and each only ever sees
-its own data. Both run in CI on every push (`.github/workflows/ci.yml`),
-each as its own clearly labeled step — a regression in either is the one
-failure in this repo that matters most.
+directly against Postgres. The rest each prove the same property end to
+end over real HTTP for one resource: two orgs exercise it in parallel,
+and each only ever sees/reaches its own data — `verify_auth_rls.py` for
+signup/login/refresh, `verify_projects_rls.py` for projects,
+`verify_tickets_rls.py` for tickets (plus the epic/story/task/subtask
+hierarchy rule), `verify_workflow_rls.py` for Kanban board columns and
+ticket moves, and `verify_invites_rls.py` for team invites and member
+management (including the last-admin-removal guard). All six run in CI
+on every push (`.github/workflows/ci.yml`), each as its own clearly
+labeled step — a regression in any of them is the failure class that
+matters most in this repo.
 
 ## Current status
 
@@ -88,12 +98,19 @@ JWT auth flow (signup/login/refresh/logout) on both backend and frontend
 with httpOnly cookies and silent token refresh, Redis-backed rate
 limiting, and a CI pipeline that guards the RLS/auth proofs on every push.
 
-**Not yet built (Phase 1):** Projects, tickets, sprints, and comments —
-the actual project-management functionality. The `/dashboard` page is
-currently a placeholder. There's also no async job queue yet (RabbitMQ is
-in the stack but unused — nothing needs it until an AI job exists to
-queue) and no pytest suite (verification so far is the proof scripts
-above, run manually and in CI).
+**Phase 1 (in progress):** Projects CRUD, ticket CRUD with an
+epic/story/task/subtask hierarchy, a Kanban board with configurable
+per-project workflow states (drag-and-drop via dnd-kit), and team
+invites + member management (an admin can invite someone into an
+existing org by email/role, manage roles, and remove members, with a
+guard against ever leaving an org with zero admins) are all built and
+proof-scripted. Not yet built: sprints, comments, and anything against
+pgvector (no embeddings/search exist yet — the extension is running but
+unused). There's also no async job queue yet (RabbitMQ is in the stack
+but unused — nothing needs it until an AI job exists to queue), no
+invite email delivery (invite links are generated but shared manually,
+by design for now), and no pytest suite (verification so far is the
+proof scripts above, run manually and in CI).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full slice-by-slice build log and
 the reasoning behind the architectural decisions along the way.

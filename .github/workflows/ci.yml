@@ -105,6 +105,48 @@ jobs:
       - name: Verify projects tenant isolation
         run: python -m scripts.verify_projects_rls
 
+      # Every proof script below signs up multiple orgs over real HTTP, and
+      # /auth/signup is rate-limited to 10/minute per IP (deliberately, to
+      # resist brute-forcing — see the rate-limiting slice). All these
+      # scripts run from the same runner IP in quick succession, so their
+      # signup counts stack on one shared budget: by itself that's already
+      # 2 (auth) + 2 (projects) = 4 above, and tickets (2) + workflow (2) +
+      # invites (7, the most signup-heavy script here) would push the total
+      # to 15 — over the limit deterministically, not flakily, since a CI
+      # job runs these steps in seconds. This doesn't test the rate limiter
+      # itself (no proof script here asserts anything about it), so
+      # resetting Redis between steps below doesn't weaken any real
+      # security proof — it just stops unrelated proof scripts from
+      # cross-talking on a shared IP-keyed budget that only exists because
+      # of how CI happens to run them back-to-back.
+      - name: Reset rate limiter (tickets)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Composite-FK tenant/scope consistency (parent_id, project_id) on
+      # top of RLS, plus the subtask-parent-type business rule and the
+      # /tree hierarchy endpoint.
+      - name: Verify tickets tenant isolation
+        run: python -m scripts.verify_tickets_rls
+
+      - name: Reset rate limiter (workflow states)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Configurable board columns + the workflow_state_id/position move
+      # path, including the move-vs-edit authorization split.
+      - name: Verify workflow-state tenant isolation
+        run: python -m scripts.verify_workflow_rls
+
+      - name: Reset rate limiter (invites)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Team invites + member management: an invite token deterministically
+      # joins its own org (never a different one), a tampered token is
+      # rejected, an invite is bound to a specific email, only admins can
+      # manage invites/members, and the last-admin-removal guard actually
+      # blocks the lockout it exists to prevent.
+      - name: Verify invites + member management
+        run: python -m scripts.verify_invites_rls
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then

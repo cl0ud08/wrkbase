@@ -563,3 +563,32 @@ the final `_issue_token_pair` call, an `UnboundLocalError` on the
 invite-redemption path specifically (the new-org path never touched that
 line). Both were caught by actually exercising the endpoints in Docker
 before writing the proof script, not by inspection.
+
+---
+
+## Slice 11 — Catching up CI, CHANGELOG, and README for Slices 8–10
+
+Tickets, the Kanban board, and Invites/Team management were each built
+and manually verified in their own turn, but — per this project's
+established discipline of pushing (and updating CI/CHANGELOG) as an
+explicit, separate step — none of it had been wired into CI or
+documented yet. This slice closes that gap for all three at once.
+
+**A rate-limit collision, found by actually running the full sequence,
+not assumed safe.** `/auth/signup` is rate-limited to 10/minute per IP.
+Every proof script signs up multiple orgs over real HTTP from the same
+runner IP; individually that's fine, but stacked back-to-back in one CI
+job the signup counts compound on one shared budget. Auth + Projects
+alone already used 4; adding Tickets (2) + Workflow (2) + Invites (7,
+the most signup-heavy script here, since it exercises tampering, replay,
+and email-mismatch paths that each cost a signup attempt) would push the
+running total to 15 in the space of a few seconds — over the limit
+deterministically, not flakily, since CI runs these steps far faster
+than the 60-second window they'd need to spread across. This doesn't
+test the rate limiter itself (no proof script asserts anything about
+it), so resetting Redis (`FLUSHALL`) between the three new steps doesn't
+weaken any real security proof — it just stops unrelated proof scripts
+from cross-talking on a budget that only exists because of how CI
+happens to run them in sequence. Verified by actually running all six
+scripts back-to-back locally with the same resets CI now uses, with no
+artificial waits, before trusting the CI YAML to work.
