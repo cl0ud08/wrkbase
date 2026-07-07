@@ -80,6 +80,16 @@ class UserLookup(Base):
 
 class Project(Base):
     __tablename__ = "projects"
+    # Async gotcha found wiring the update endpoint up: without
+    # eager_defaults, the ORM defers fetching server_onupdate-marked
+    # columns until the next attribute access, expecting a transparent
+    # lazy-load. Under async SQLAlchemy there's no such thing — that access
+    # has to be awaited, and FastAPI's response serialization can't await
+    # mid-attribute-read. It surfaced as a 500 (MissingGreenlet) on the very
+    # first real UPDATE. eager_defaults forces the UPDATE statement itself
+    # to RETURNING the trigger-modified updated_at, so the in-memory object
+    # is already correct by the time serialization touches it.
+    __mapper_args__ = {"eager_defaults": True}
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
