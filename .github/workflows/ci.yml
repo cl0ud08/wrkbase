@@ -98,6 +98,13 @@ jobs:
       - name: Verify auth + RLS integration
         run: python -m scripts.verify_auth_rls
 
+      # First proof that a resource beyond auth inherits tenant isolation
+      # for free from the existing get_current_auth + RLS wiring: org A
+      # directly GETs/PATCHes org B's real project ID by guessing it, not
+      # just checks it's absent from a list.
+      - name: Verify projects tenant isolation
+        run: python -m scripts.verify_projects_rls
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
