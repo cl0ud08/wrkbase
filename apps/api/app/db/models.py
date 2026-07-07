@@ -54,3 +54,25 @@ class User(Base):
         server_default=UserRole.MEMBER.value,
     )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+class UserLookup(Base):
+    """email -> (org_id, user_id) routing only. No RLS, no password hash.
+
+    Kept in sync by a Postgres trigger on `users` (migration 0002), not by
+    application code, so the invariant holds no matter which code path
+    inserts a user. The app only ever reads this table.
+    """
+
+    __tablename__ = "user_lookup"
+
+    email: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )

@@ -5,12 +5,15 @@
 
 import asyncio
 
+from app.core.security import hash_password
 from app.db.models import Organization, User, UserRole
 from app.db.session import AsyncSessionLocal, set_tenant_context
 
+SEED_PASSWORD = "wrkbase-dev-password"
+
 ORGS = [
-    {"name": "Acme Corp", "user_email": "alice@acme.test"},
-    {"name": "Globex Inc", "user_email": "bob@globex.test"},
+    {"name": "Acme Corp", "user_email": "alice@acme.dev"},
+    {"name": "Globex Inc", "user_email": "bob@globex.dev"},
 ]
 
 
@@ -28,7 +31,7 @@ async def main() -> None:
             user = User(
                 org_id=org.id,
                 email=org_spec["user_email"],
-                hashed_password="not-a-real-hash-yet",  # auth slice replaces this
+                hashed_password=hash_password(SEED_PASSWORD),
                 role=UserRole.ADMIN,
             )
             session.add(user)

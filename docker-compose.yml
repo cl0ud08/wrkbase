@@ -36,6 +36,10 @@ services:
       ADMIN_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       APP_DB_USER: ${APP_DB_USER}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      # Container-to-container traffic always uses redis's internal port
+      # (6379), not REDIS_PORT (that's only the host-facing mapping).
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
     ports:
       - "${API_PORT}:8000"
     volumes:
