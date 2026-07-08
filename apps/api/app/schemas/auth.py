@@ -82,3 +82,40 @@ class PasswordResetConfirm(BaseModel):
 
 class PasswordResetConfirmResponse(BaseModel):
     message: str = "Password has been reset. Please log in with your new password."
+
+
+class SignupResponse(TokenPair):
+    # None for an invite-redeeming signup (see signup() in app/api/auth.py
+    # — an invite already binds the account to a specific, admin-vouched-
+    # for email, so no separate verification step exists for that path at
+    # all) or if the response is otherwise not applicable. Populated for a
+    # brand-new self-serve org's first user — same dev-mode-only stand-in
+    # for real email delivery as PasswordResetRequestResponse.reset_link,
+    # not how this would work in production.
+    verification_link: str | None = None
+
+
+class EmailVerifyRequest(BaseModel):
+    token: str
+
+
+class EmailVerifyResponse(BaseModel):
+    message: str = "Email verified."
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return value.lower()
+
+
+class ResendVerificationResponse(BaseModel):
+    # Same enumeration-safety shape as PasswordResetRequestResponse, and
+    # for the same reason — this is public/unauthenticated and must not
+    # become an oracle for "is this email registered." See
+    # resend_verification in app/api/auth.py.
+    message: str = "If an account exists for this email and needs verification, a new link has been generated."
+    verification_link: str
