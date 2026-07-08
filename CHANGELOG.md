@@ -1147,3 +1147,140 @@ restructured, not just recolored — `Card` gained a `ticketKey` prop
 and a `TypeBadge`, hover/drag states were rewritten against new
 tokens — this slice's regression pass re-confirms drag-and-drop itself
 still works end to end, not just that the new styles compile.
+
+---
+
+## Slice 17 — Phase 1c: Backlog + Sprints + story points
+
+**Built:** A `sprints` table (migration 0012) with the same org-scoped-
+AND-project-scoped shape as `workflow_states` — RLS plus a composite
+`(project_id, org_id)` FK — and `tickets.sprint_id`/`story_points`.
+Sprint CRUD, `start`/`complete` status-transition actions, a bulk
+backlog-to-sprint assignment endpoint, a paginated backlog view, and a
+server-computed `total_points` per sprint. Frontend: a sprints index,
+a backlog page with checkbox multi-select, and a two-pane drag-and-
+drop planning view. Built contract-first, same discipline as every
+slice since Tickets: Pydantic schemas and the matching TypeScript
+interfaces were written and reviewed before any endpoint logic
+existed to implement them.
+
+**Single-active-sprint: a genuinely third category, not RLS's
+reasoning or soft-delete's reasoning reapplied.** The rule — at most
+one sprint per project can be `active` — is enforced by a partial
+unique index (`CREATE UNIQUE INDEX ... ON sprints (project_id) WHERE
+status = 'active'`), not an app-layer check-then-write. Working
+through why against the two precedents this app already has:
+
+- RLS's shape is *an unconditional trust boundary with zero
+  legitimate exceptions*, and the risk it defends against is a future
+  code path forgetting to check at all — which is why it has to live
+  in the database as a policy nothing can accidentally bypass.
+- Soft-delete's shape is *a business rule with exactly one legitimate,
+  deliberate exception* (restore), which is why an app-layer
+  `.where()` fit — it can express "except here" cleanly, and a
+  blanket DB policy can't.
+- Single-active-sprint fits neither. There's no legitimate exception
+  the way restore is one — two active sprints in a project is never
+  correct, full stop. But it also isn't primarily a "don't trust every
+  future query" problem the way RLS is. It's a **plain uniqueness
+  invariant with a real concurrency hazard**: two nearly-simultaneous
+  "start sprint" requests for two different sprints in the same
+  project. An app-layer check (`SELECT` for an existing active sprint,
+  then `UPDATE`) is a textbook time-of-check-to-time-of-use race —
+  both requests can pass the check before either commits, and both
+  end up active. Only a constraint Postgres enforces atomically at
+  write time closes that, regardless of how the two transactions
+  interleave.
+
+Proven as a race, not asserted sequentially:
+`scripts/verify_sprints_rls.py` fires two `start` calls at two
+different sprints in the same project via `asyncio.gather`, then
+asserts the status codes are exactly one `200` and one `409`, and
+that a follow-up `GET` shows exactly one sprint actually active. A
+sequential "call start twice and check the second one fails" test
+would have passed even if the constraint were missing entirely — it
+wouldn't have exercised the interleaving that's the actual risk here.
+`start_sprint` catches the resulting `IntegrityError` from the losing
+request and turns it into a clean `409`, same shape as the `IntegrityError`-to-409
+translation this app has used before soft-delete replaced it for
+tickets.
+
+**Completing a sprint returns unfinished work to the backlog — with a
+named, deliberate limitation.** Backlog is defined simply as
+`sprint_id IS NULL`. `complete_sprint` sets `sprint_id = NULL` on
+every ticket in the sprint that is *not* in the project's terminal
+workflow column, so unfinished work is immediately eligible for the
+next sprint's planning without anyone having to notice and move it by
+hand. A ticket that *did* reach the terminal column keeps its
+`sprint_id` pointing at the now-completed sprint — that's the only
+record of what the sprint actually finished, useful for velocity
+reporting later, and it's why the backlog definition doesn't also
+match "sprint_id points at a completed sprint": that would resurface
+finished work too, not just unfinished work.
+
+The limitation, stated plainly rather than hidden in behavior: this
+app has no explicit `is_done`/terminal flag on `WorkflowState`, so
+"the column with the highest `order` value" stands in for "done."
+That's true for the default seeded workflow and true for any project
+that hasn't added columns after its real done state, but it is a
+heuristic, not a guarantee — a project with, say, a trailing "Won't
+Fix" or "Blocked (Reopened)" column after its actual done state would
+misclassify tickets sitting in that column as "unfinished" on
+completion. **Flagged here as a concrete candidate for the next
+workflow-states revision**: a real terminal/`is_done` flag on
+`WorkflowState`, replacing this order-based proxy once workflow
+states support configuring which column actually means done. Not
+built now — this slice is about sprints, not redesigning workflow
+state configuration, and shipping a flag with no UI to set it would
+just be dead schema, the same "don't add reflexively" call this app
+made about `eager_defaults` on `WorkflowState` and about project
+archiving after soft-delete.
+
+**`total_points` is computed server-side, never left for the frontend
+to sum.** `SprintRead` carries a `total_points` field that isn't a
+stored column — it's `SUM(story_points)` over the sprint's current,
+non-deleted tickets, attached to the ORM object before serialization.
+Named `total_points` rather than `capacity` on purpose: in Scrum,
+"capacity" usually means the team's *available* effort, a number this
+app doesn't model at all, and reusing that word for "sum of what's
+committed" would be a quiet accuracy bug in the vocabulary, not just
+the code. `list_sprints` computes every sprint's total in one grouped
+query (`GROUP BY sprint_id`), not one query per sprint — the same
+N+1 avoidance every other list endpoint in this app already follows.
+
+**Backlog pagination — the gap flagged a while back, finally
+addressed, and addressed here first rather than retrofitted.** Plain
+offset/limit (`?limit=&offset=`, capped at 200), returning
+`{items, total, limit, offset}`. Chosen over keyset/cursor pagination
+because a project's backlog is hundreds of tickets, not millions, and
+the acknowledged tradeoff — a concurrent insert or delete during
+paging can shift which tickets land on which page — is a UI-polish
+nit for a backlog view, not a correctness or security issue the way
+it would be for, say, an audit log. Keyset's added complexity isn't
+worth paying for in this first pass.
+
+**Authorization split, extended, not reinvented.** Sprint
+create/update/delete/start/complete are admin-only, same class of
+"shared structure, not a personal resource" as `WorkflowState` — a
+sprint has no `created_by` (deliberately absent from the contract:
+planning artifacts aren't owned the way a ticket or project is).
+Moving tickets into or out of a sprint — a plain ticket `PATCH` with
+`sprint_id`, or the bulk `.../assign` endpoint — stays open to any
+org member: `sprint_id` and `story_points` both joined
+`_COLLABORATIVE_FIELDS` alongside `workflow_state_id`/`position`/
+`assignee_id`, the same split that already separates "who can define
+a board column" from "who can drag a card into one."
+
+**Verified.** `scripts/verify_sprints_rls.py` (new, wired into CI
+right after the workflow-state proof script): cross-org sprint access
+rejected at the project-lookup stage (RLS-driven, not a special case),
+cross-project `sprint_id` assignment rejected structurally (same
+class of check as a cross-org assignee), the concurrent-start race
+described above, paginated backlog honoring `limit`/`offset`/`total`,
+bulk-assign rejecting anything not currently in the backlog, `total_points`
+matching a hand-computed sum, and the full start → complete →
+auto-return → reappears-in-backlog lifecycle. Full seven-script
+backend regression (the six existing scripts plus this one), `ruff`,
+and `pip-audit` all re-run clean afterward; frontend `ESLint`,
+`tsc --noEmit`, and a full `next build` all clean with every new route
+registered.

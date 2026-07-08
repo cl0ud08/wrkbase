@@ -344,6 +344,18 @@ export default function ProjectBoardPage() {
         </div>
         <div className="flex gap-2">
           <a
+            href={`/projects/${projectId}/backlog`}
+            className="rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover"
+          >
+            Backlog
+          </a>
+          <a
+            href={`/projects/${projectId}/sprints`}
+            className="rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover"
+          >
+            Sprints
+          </a>
+          <a
             href={`/projects/${projectId}/settings`}
             className="rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover"
           >
