@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     # revisited days later — the shorter the window, the smaller a leaked
     # or intercepted reset link's blast radius.
     password_reset_expire_minutes: int = 45
+    # Much longer than password reset, deliberately: verification is a
+    # soft nudge, not a security-sensitive credential grant (see
+    # User.is_verified's docstring) — there's no comparable blast-radius
+    # argument for a short window, and a real inbox check often doesn't
+    # happen within the hour, let alone within minutes.
+    email_verification_expire_hours: int = 48
 
     # Connects as the least-privilege `wrkbase_app` role (see migration 0001),
     # never as the Postgres superuser used to run migrations.

@@ -19,6 +19,7 @@ from app.core.security import (
 )
 from app.core.ticket_prefix import derive_ticket_prefix
 from app.db.models import (
+    EmailVerificationToken,
     Invite,
     InviteLookup,
     Organization,
@@ -29,6 +30,8 @@ from app.db.models import (
 )
 from app.db.session import get_db, set_tenant_context
 from app.schemas.auth import (
+    EmailVerifyRequest,
+    EmailVerifyResponse,
     LoginRequest,
     LogoutRequest,
     PasswordResetConfirm,
@@ -36,7 +39,10 @@ from app.schemas.auth import (
     PasswordResetRequest,
     PasswordResetRequestResponse,
     RefreshRequest,
+    ResendVerificationRequest,
+    ResendVerificationResponse,
     SignupRequest,
+    SignupResponse,
     TokenPair,
 )
 from app.services.refresh_tokens import (
@@ -56,6 +62,10 @@ _INVALID_INVITE = HTTPException(
 )
 _INVALID_RESET_TOKEN = HTTPException(
     status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid, expired, or already-used reset link"
+)
+_INVALID_VERIFICATION_TOKEN = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail="Invalid, expired, or already-used verification link",
 )
 
 
@@ -147,20 +157,42 @@ async def _issue_token_pair(
     return TokenPair(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
+async def _issue_verification_token(db: AsyncSession, user_id: uuid.UUID) -> str:
+    # Invalidates any prior still-live token for this user first — at most
+    # one live verification link at a time, by design (see
+    # EmailVerificationToken's docstring for why this deliberately differs
+    # from password reset, which allows several to coexist). A no-op for a
+    # brand-new signup (nothing to invalidate yet), the actual point for
+    # resend_verification below.
+    await db.execute(
+        update(EmailVerificationToken)
+        .where(EmailVerificationToken.user_id == user_id, EmailVerificationToken.used_at.is_(None))
+        .values(used_at=datetime.now(timezone.utc))
+    )
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        hours=settings.email_verification_expire_hours
+    )
+    db.add(EmailVerificationToken(user_id=user_id, token=token, expires_at=expires_at))
+    await db.commit()
+    return f"{settings.frontend_url}/verify-email?token={token}"
+
+
+@router.post("/signup", response_model=SignupResponse, status_code=status.HTTP_201_CREATED)
 # Always keyed by IP regardless of any stray cookie — signup/login are the
 # endpoints most likely to be brute-forced, and the whole allowance should
 # be tied to the caller's network origin, not an identity they don't have yet.
 @limiter.limit("10/minute", key_func=get_remote_address)
 async def signup(
     request: Request, payload: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)
-) -> TokenPair:
+) -> SignupResponse:
     # Two paths sharing one endpoint. No invite_token: first user of a
     # brand-new org, self-serve, same pattern as Slack/Linear/Notion
     # onboarding — org_name is required (enforced in SignupRequest). A
     # valid invite_token: join that invite's existing org, with that
     # invite's role, instead — org_name is ignored.
-    if payload.invite_token:
+    is_invited = bool(payload.invite_token)
+    if is_invited:
         org_id, role = await _redeem_invite(db, payload.invite_token, payload.email)
     else:
         org = Organization(name=payload.org_name, ticket_prefix=derive_ticket_prefix(payload.org_name))
@@ -174,6 +206,13 @@ async def signup(
         email=payload.email,
         hashed_password=await hash_password(payload.password),
         role=role,
+        # True for an invite redemption: the invite already binds this
+        # account to a specific, admin-vouched-for email (see
+        # _redeem_invite's email-binding check above) — a stronger trust
+        # signal than a self-click link, so a separate verification step
+        # would be redundant friction. False (soft-nudge, not a gate —
+        # see User.is_verified's docstring) for a brand-new self-serve org.
+        is_verified=is_invited,
     )
     db.add(user)
     try:
@@ -182,7 +221,10 @@ async def signup(
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already in use")
 
-    return await _issue_token_pair(response, user_id=user.id, org_id=org_id, role=user.role.value)
+    verification_link = None if is_invited else await _issue_verification_token(db, user.id)
+
+    tokens = await _issue_token_pair(response, user_id=user.id, org_id=org_id, role=user.role.value)
+    return SignupResponse(**tokens.model_dump(), verification_link=verification_link)
 
 
 @router.post("/login", response_model=TokenPair)
@@ -407,6 +449,81 @@ async def confirm_password_reset(
     return PasswordResetConfirmResponse()
 
 
+@router.post("/verify-email", response_model=EmailVerifyResponse)
+async def verify_email(
+    payload: EmailVerifyRequest, db: AsyncSession = Depends(get_db)
+) -> EmailVerifyResponse:
+    result = await db.execute(
+        select(EmailVerificationToken).where(EmailVerificationToken.token == payload.token)
+    )
+    verify_token = result.scalar_one_or_none()
+    if (
+        verify_token is None
+        or verify_token.used_at is not None
+        or verify_token.expires_at < datetime.now(timezone.utc)
+    ):
+        raise _INVALID_VERIFICATION_TOKEN
+
+    # Same two-step pre-auth bootstrap shape as confirm_password_reset:
+    # unauthenticated, no tenant context yet, and EmailVerificationToken
+    # carries no org_id of its own — UserLookup's unique user_id index
+    # recovers it.
+    lookup_result = await db.execute(
+        select(UserLookup).where(UserLookup.user_id == verify_token.user_id)
+    )
+    lookup = lookup_result.scalar_one_or_none()
+    if lookup is None:
+        raise _INVALID_VERIFICATION_TOKEN
+
+    await set_tenant_context(db, lookup.org_id)
+    user_result = await db.execute(select(User).where(User.id == verify_token.user_id))
+    user = user_result.scalar_one_or_none()
+    if user is None:
+        raise _INVALID_VERIFICATION_TOKEN
+
+    user.is_verified = True
+    verify_token.used_at = datetime.now(timezone.utc)
+    await db.commit()
+    # No session revocation here, unlike password reset — verifying an
+    # email isn't a "the account might be compromised" event, so there's
+    # nothing to protect existing sessions from. This is a deliberate
+    # non-decision, not an oversight.
+    return EmailVerifyResponse()
+
+
+@router.post("/resend-verification", response_model=ResendVerificationResponse)
+# Stricter than login/signup, same 5/minute as password-reset/request and
+# for the same reason — plus a concrete second one once real email
+# delivery exists: this becomes a way to flood a real inbox with unwanted
+# verification emails for an address the caller doesn't own.
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def resend_verification(
+    request: Request, payload: ResendVerificationRequest, db: AsyncSession = Depends(get_db)
+) -> ResendVerificationResponse:
+    # Same enumeration-safety shape as request_password_reset: a token is
+    # generated unconditionally, but only ever persisted (and only ever
+    # valid) when the email resolves to a real, still-unverified account.
+    # The response is identical either way — including for an email that's
+    # real but *already* verified, which gets the same generic message
+    # rather than a distinct "already verified" reply that would itself
+    # leak account-existence information.
+    token = secrets.token_urlsafe(32)
+
+    lookup_result = await db.execute(select(UserLookup).where(UserLookup.email == payload.email))
+    lookup = lookup_result.scalar_one_or_none()
+    if lookup is not None:
+        await set_tenant_context(db, lookup.org_id)
+        user_result = await db.execute(select(User).where(User.id == lookup.user_id))
+        user = user_result.scalar_one_or_none()
+        if user is not None and not user.is_verified:
+            link = await _issue_verification_token(db, user.id)
+            return ResendVerificationResponse(verification_link=link)
+
+    return ResendVerificationResponse(
+        verification_link=f"{settings.frontend_url}/verify-email?token={token}"
+    )
+
+
 @router.get("/me")
 async def me(
     auth: AuthContext = Depends(get_current_auth), db: AsyncSession = Depends(get_db)
@@ -434,4 +551,8 @@ async def me(
         "ticket_prefix": org.ticket_prefix,
         "role": user.role.value,
         "org_user_count": org_user_count,
+        # Soft-nudge, not a gate — see User.is_verified's docstring. The
+        # frontend uses this to show a persistent-but-non-blocking banner,
+        # not to lock anything.
+        "is_verified": user.is_verified,
     }

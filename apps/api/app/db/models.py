@@ -76,6 +76,17 @@ class User(Base):
         nullable=False,
         server_default=UserRole.MEMBER.value,
     )
+    # True immediately for an invite-redeeming signup (see signup() in
+    # app/api/auth.py) — an invite already binds the account to a
+    # specific, admin-vouched-for email, a stronger trust signal than a
+    # self-click verification link, so requiring both would be redundant
+    # friction. False (the default) for a brand-new self-serve org's
+    # first user, until they use an EmailVerificationToken. Soft-nudge,
+    # not a gate: this app's security model is tenant isolation, not
+    # identity — an unverified user can't see anyone else's data any more
+    # than a verified one can, so nothing in the app actually checks this
+    # to block access. See CHANGELOG.md for the full reasoning.
+    is_verified: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
 
 
@@ -411,6 +422,35 @@ class PasswordResetToken(Base):
     # Opaque random token (secrets.token_urlsafe), same reasoning as
     # invite/refresh tokens — see app/api/invites.py's create_invite for
     # the full "why not a JWT" writeup, which applies identically here.
+    token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+class EmailVerificationToken(Base):
+    """A single-use, short-lived credential for verifying one user's email.
+    Same no-org_id, no-RLS shape as PasswordResetToken, for the identical
+    reason — see that class's docstring. Unlike password reset, at most
+    one of these is ever live for a given user at a time: resend_
+    verification invalidates any prior outstanding token immediately
+    (see app/api/auth.py), not just when one is eventually used. Password
+    reset deliberately allows several outstanding tokens to coexist
+    (someone troubleshooting from more than one device); a verification
+    resend more plainly means "the old link doesn't matter anymore, send
+    me a fresh one" — keeping exactly one live token avoids any ambiguity
+    about which link is real and keeps this table from accumulating
+    stale rows for someone who clicks resend repeatedly.
+    """
+
+    __tablename__ = "email_verification_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
     token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
