@@ -75,7 +75,7 @@ function SignupForm() {
         return;
       }
       await refreshUser();
-      router.push("/");
+      router.push("/dashboard");
       return;
     }
 
@@ -86,7 +86,7 @@ function SignupForm() {
 
   async function handleContinue() {
     await refreshUser();
-    router.push("/");
+    router.push("/dashboard");
   }
 
   if (verificationLink) {

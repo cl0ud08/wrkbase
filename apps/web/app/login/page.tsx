@@ -28,7 +28,7 @@ export default function LoginPage() {
 
     if (res.ok) {
       await refreshUser();
-      router.push("/");
+      router.push("/dashboard");
       return;
     }
 
