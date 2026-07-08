@@ -1541,3 +1541,93 @@ working, not just that the newer one succeeds. Full nine-script
 backend regression, `ruff`, and `pip-audit` all clean; frontend
 `ESLint`, `tsc --noEmit`, and a full `next build` clean with
 `/verify-email` registered.
+
+---
+
+## Slice 20 — SaaS marketing landing page, plus two real bugs the
+review pass caught
+
+**Built:** `/` rebuilt as a genuine SaaS marketing page — hero with a
+live interactive demo (type a plain-English bug report, watch it
+parse into a structured, triaged ticket), six benefit-led feature
+sections, a static before/after comparison with an animated time
+stat, a scroll-paced ticket-lifecycle sequence, three real pricing
+tiers ($0 / $5 / $12 per user/month), and a "who it's for" trust
+section with no fabricated testimonials. Deliberately feature-only:
+no build-log narrative, no competitor named anywhere, no GitHub link
+as a CTA (moved to the footer only). `motion` (Framer Motion's
+current package) was added as a real dependency here, not a
+gratuitous one — `whileInView`, `useReducedMotion`, and layout-aware
+`animate()` genuinely replace what would otherwise have been hand-
+rolled `IntersectionObserver` plumbing and manual reduced-motion
+branching repeated at every call site.
+
+**Routing: `/` is now permanently the marketing page, authenticated
+or not** — the existing `(shell)` routes (`/dashboard`,
+`/projects/*`, `/team`) deliberately did not move to an `/app` prefix;
+they were already login-gated by `proxy.ts`, so moving them would
+have been a large refactor (updating every internal `href` across the
+app) in exchange for a URL-naming preference, not a functional gap.
+`LandingPage` reads auth state itself and swaps every CTA ("Start
+free trial" → "Go to dashboard") rather than the page redirecting a
+signed-in visitor away from their own homepage, the same pattern real
+SaaS marketing sites use.
+
+**Bug 1 — signup and login silently stopped landing users in the
+app.** Both `router.push("/")` on success, dating from when `/`
+auto-redirected a logged-in visitor straight to `/dashboard`. That
+auto-redirect was the thing this slice deliberately removed (see
+above) — and nothing else was checking for the gap it left behind.
+The result wasn't an error or a broken build: `/` is a perfectly
+valid, 200-rendering route either way, so `tsc`, `ESLint`, and
+`next build` all stayed clean through it. A brand-new user finishing
+signup, or an existing one logging in, landed back on marketing copy
+trying to sell them the product they'd just joined — one avoidable
+extra click, not a crash, which is exactly the kind of regression
+that survives every automated check this project runs and only
+surfaces from someone actually clicking through the flow. Fixed by
+pointing both redirects at `/dashboard` directly. Worth naming
+plainly: this class of bug — a client-side navigation target
+becoming stale after an unrelated page's behavior changed underneath
+it — has no automated guardrail in this stack today; the six-plus
+backend proof scripts and the frontend's lint/type-check/build
+pipeline all verify *shape* (does the code compile, does the route
+exist, does the API contract hold), not *flow* (does clicking through
+signup actually land you where a signed-up user should land).
+
+**Bug 2 — the hero demo's jump cut, and why the first diagnosis was
+wrong.** The original suspicion (mine, going into this slice's
+review) was that the input box not visually shrinking before the
+ticket card appeared below it read as abrupt — the "hand-off
+compression" beat that got simplified away during the initial build.
+Looking at the actually-built sequence beat by beat instead of
+guessing: the input staying a fixed size while new content appears
+below it is an ordinary, well-understood pattern (inline search
+results, validation messages) — not the defect. The real one was
+smaller and easy to miss: the cursor blink and the accent processing-
+dot are both `motion.span` elements inside an `AnimatePresence`, and
+neither had an `exit` prop set. Without one, `AnimatePresence` doesn't
+transition an element out when its render condition goes false — it
+just deletes it, instantly, on the same frame the ticket card begins
+its own (properly transitioned) fade-in. Every *other* moving part of
+the handoff — the input's border color, the card's entrance — already
+had a real transition; the one that didn't was the least visually
+prominent element in the whole sequence, which is exactly why it was
+misdiagnosed as a sizing problem on the big, obvious box instead.
+Fixed with a two-line addition (`exit={{ opacity: 0 }}` on both spans),
+not a new animation. The debugging lesson worth keeping: when an
+`AnimatePresence` sequence feels like it's cutting somewhere, check
+every child's `exit` prop before touching the layout of the child
+that's easiest to look at — the missing transition is as likely to be
+on the small auxiliary element nobody's looking at as on the thing
+that visually dominates the frame.
+
+**Verified.** `ESLint`, `tsc --noEmit`, and a full `next build` clean
+after both fixes. Routing re-checked over real HTTP (not just read
+from the code): signup and login via the actual `/api/auth/*` proxy
+paths both establish a valid session and `/dashboard` resolves `200`
+under it; `/` still resolves `200` and serves the marketing page for
+a request carrying no session cookie at all. The literal client-side
+`router.push` navigation itself — the browser's URL bar actually
+changing after a button click — isn't something curl can execute;
+that part was confirmed by hand, in a real browser, not simulated.

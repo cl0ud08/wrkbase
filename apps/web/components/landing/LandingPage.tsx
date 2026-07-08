@@ -219,6 +219,7 @@ function HeroDemo() {
                 key="cursor"
                 className="h-4 w-[2px] flex-shrink-0 bg-ink-tertiary"
                 animate={{ opacity: [1, 1, 0, 0] }}
+                exit={{ opacity: 0, transition: { duration: 0.12 } }}
                 transition={{ duration: 0.9, repeat: Infinity, times: [0, 0.5, 0.51, 1] }}
               />
             )}
@@ -227,6 +228,7 @@ function HeroDemo() {
                 key="dot"
                 className="h-2 w-2 flex-shrink-0 rounded-full bg-accent"
                 animate={{ opacity: [1, 0.35, 1] }}
+                exit={{ opacity: 0, transition: { duration: 0.15 } }}
                 transition={{ duration: 0.5, repeat: Infinity }}
               />
             )}
