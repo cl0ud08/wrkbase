@@ -166,6 +166,17 @@ jobs:
       - name: Verify password reset
         run: python -m scripts.verify_password_reset
 
+      - name: Reset rate limiter (email verification)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Email verification: the invite-skips-verification decision, the
+      # soft-nudge-not-a-gate decision (an unverified user can do
+      # everything a verified one can), reuse/expiry rejection, and that a
+      # resend genuinely invalidates the prior token rather than letting
+      # two live ones coexist.
+      - name: Verify email verification
+        run: python -m scripts.verify_email_verification
+
       # First proof that a resource beyond auth inherits tenant isolation
       # for free from the existing get_current_auth + RLS wiring: org A
       # directly GETs/PATCHes org B's real project ID by guessing it, not
