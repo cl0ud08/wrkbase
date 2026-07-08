@@ -18,6 +18,10 @@ class TicketCreate(BaseModel):
     # None = unassigned. Allowed at creation for symmetry with PATCH rather
     # than forcing a create-then-immediately-assign round trip.
     assignee_id: uuid.UUID | None = None
+    # None = backlog (the default for a newly created ticket — nothing is
+    # planned into a sprint just by existing).
+    sprint_id: uuid.UUID | None = None
+    story_points: int | None = Field(default=None, ge=0)
 
 
 class TicketUpdate(BaseModel):
@@ -29,6 +33,8 @@ class TicketUpdate(BaseModel):
     workflow_state_id: uuid.UUID | None = None
     position: float | None = None
     assignee_id: uuid.UUID | None = None
+    sprint_id: uuid.UUID | None = None
+    story_points: int | None = Field(default=None, ge=0)
 
 
 class TicketRead(BaseModel):
@@ -54,6 +60,12 @@ class TicketRead(BaseModel):
     # Nullable: unassigned, or a removed member's old assignment (migration
     # 0009 sets this NULL on member removal, same as created_by).
     assignee_id: uuid.UUID | None
+    # Nullable: NULL means "in the backlog" (see GET .../tickets/backlog).
+    # Also goes back to NULL automatically for a ticket that was in an
+    # active sprint but not in the project's terminal workflow state when
+    # that sprint was completed — see complete_sprint in app/api/sprints.py.
+    sprint_id: uuid.UUID | None
+    story_points: int | None
     created_at: datetime
     updated_at: datetime
     # Not settable via TicketUpdate — only DELETE/{id}/restore touch this.
@@ -65,3 +77,17 @@ class TicketTreeNode(TicketRead):
 
 
 TicketTreeNode.model_rebuild()
+
+
+class TicketPage(BaseModel):
+    # Offset pagination, not keyset/cursor: simpler to reason about and
+    # plenty for a project's backlog (hundreds of tickets, not millions).
+    # The acknowledged tradeoff — a concurrent insert/delete during
+    # paging can shift which items land on which page — is a UI-polish
+    # nit here, not a correctness or security issue the way it would be
+    # for, say, an audit log, so it's not worth keyset's added complexity
+    # in this first pass.
+    items: list[TicketRead]
+    total: int
+    limit: int
+    offset: int

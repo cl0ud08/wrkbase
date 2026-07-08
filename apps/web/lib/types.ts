@@ -54,6 +54,9 @@ export interface Ticket {
   // Combine with the current org's ticketPrefix (see lib/auth-context.tsx)
   // to render a ticket's display key, e.g. "WRK-142".
   ticketNumber: number;
+  // null = in the backlog (see fetchBacklog / mapSprint below).
+  sprintId: string | null;
+  storyPoints: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -75,6 +78,8 @@ interface TicketApiResponse {
   created_by: string | null;
   assignee_id: string | null;
   ticket_number: number;
+  sprint_id: string | null;
+  story_points: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -93,8 +98,82 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     createdBy: data.created_by,
     assigneeId: data.assignee_id,
     ticketNumber: data.ticket_number,
+    sprintId: data.sprint_id,
+    storyPoints: data.story_points,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
+  };
+}
+
+// Offset pagination — matches TicketPage in apps/api/app/schemas/ticket.py.
+export interface TicketPage {
+  items: Ticket[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+interface TicketPageApiResponse {
+  items: TicketApiResponse[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export function mapTicketPage(data: TicketPageApiResponse): TicketPage {
+  return {
+    items: data.items.map(mapTicket),
+    total: data.total,
+    limit: data.limit,
+    offset: data.offset,
+  };
+}
+
+export type SprintStatus = "planned" | "active" | "completed";
+
+export interface Sprint {
+  id: string;
+  orgId: string;
+  projectId: string;
+  name: string;
+  goal: string | null;
+  startDate: string;
+  endDate: string;
+  status: SprintStatus;
+  // Computed server-side (sum of story_points for the sprint's current
+  // tickets) — see apps/api/app/api/sprints.py. Never derive this by
+  // summing a fetched ticket list client-side; the backend is the only
+  // place that's guaranteed consistent with what a ticket list endpoint
+  // would return at the same instant.
+  totalPoints: number;
+  createdAt: string;
+}
+
+interface SprintApiResponse {
+  id: string;
+  org_id: string;
+  project_id: string;
+  name: string;
+  goal: string | null;
+  start_date: string;
+  end_date: string;
+  status: SprintStatus;
+  total_points: number;
+  created_at: string;
+}
+
+export function mapSprint(data: SprintApiResponse): Sprint {
+  return {
+    id: data.id,
+    orgId: data.org_id,
+    projectId: data.project_id,
+    name: data.name,
+    goal: data.goal,
+    startDate: data.start_date,
+    endDate: data.end_date,
+    status: data.status,
+    totalPoints: data.total_points,
+    createdAt: data.created_at,
   };
 }
 
