@@ -21,6 +21,12 @@ function SignupForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Set only for a self-serve signup (see apps/api/app/api/auth.py's
+  // signup — null for an invite redemption, which is auto-verified and
+  // has nothing to confirm). Holding this back from an immediate redirect
+  // is what actually shows the "check your email" state below; joining
+  // via invite skips straight to the dashboard, same as before this slice.
+  const [verificationLink, setVerificationLink] = useState<string | null>(null);
 
   // null = no token / not checked yet, "loading", a preview, or "invalid".
   const [preview, setPreview] = useState<InvitePreview | "loading" | "invalid" | null>(
@@ -58,6 +64,16 @@ function SignupForm() {
     });
 
     if (res.ok) {
+      const data = await res.json();
+      if (data.verification_link) {
+        // Self-serve signup: hold here and show the confirmation state
+        // below instead of redirecting immediately. Not a gate — the
+        // account is already fully usable — just a moment to surface the
+        // dev-mode link before moving on.
+        setVerificationLink(data.verification_link);
+        setSubmitting(false);
+        return;
+      }
       await refreshUser();
       router.push("/");
       return;
@@ -66,6 +82,43 @@ function SignupForm() {
     const data = await res.json().catch(() => null);
     setError(data?.detail ?? "Signup failed. Please try again.");
     setSubmitting(false);
+  }
+
+  async function handleContinue() {
+    await refreshUser();
+    router.push("/");
+  }
+
+  if (verificationLink) {
+    return (
+      <div className="flex w-full max-w-sm flex-col items-center gap-4 text-center">
+        <div className="flex items-center gap-2">
+          <span className="h-2 w-2 rounded-sm bg-accent shadow-[0_0_10px_var(--accent)]" aria-hidden="true" />
+          <h1 className="text-xl font-bold tracking-tight text-ink">Check your email</h1>
+        </div>
+        <p className="text-sm text-ink-secondary">
+          Your workspace is ready to use right away — verifying just makes sure we can reach you for
+          things like password resets later.
+        </p>
+        <div className="w-full rounded-md border border-accent bg-accent-subtle p-3 text-left text-sm">
+          <p className="text-accent-subtle-text">
+            Dev mode: email sending isn&apos;t wired up yet, so here&apos;s the link directly.
+          </p>
+          <a
+            href={verificationLink}
+            className="mt-1 block truncate font-mono text-xs text-ink underline decoration-dotted"
+          >
+            {verificationLink}
+          </a>
+        </div>
+        <button
+          onClick={handleContinue}
+          className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
+        >
+          Continue to dashboard
+        </button>
+      </div>
+    );
   }
 
   if (preview === "loading") {

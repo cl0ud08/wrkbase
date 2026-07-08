@@ -14,6 +14,10 @@ interface AuthUser {
   // WRK-142) — see app/(shell)/projects/[projectId]/page.tsx.
   ticketPrefix: string;
   role: string;
+  // Soft-nudge, not a gate — see apps/api/app/db/models.py's
+  // User.is_verified docstring. Used only to show a dismissible-in-
+  // spirit (but persistent) banner in the shell, never to block a route.
+  isVerified: boolean;
 }
 
 interface AuthContextValue {
@@ -40,6 +44,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         orgName: data.org_name,
         ticketPrefix: data.ticket_prefix,
         role: data.role,
+        isVerified: data.is_verified,
       });
     } else {
       setUser(null);

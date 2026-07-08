@@ -1408,3 +1408,136 @@ already established for member removal, not an assumption that the
 revocation call worked. Full eight-script backend regression, `ruff`,
 and `pip-audit` all clean; frontend `ESLint`, `tsc --noEmit`, and a
 full `next build` clean with both new routes registered.
+
+---
+
+## Slice 19 — Phase 1d: Email verification
+
+**Built:** `EmailVerificationToken` (migration 0014, same no-org_id,
+no-RLS shape as `PasswordResetToken` and for the identical reason —
+no authenticated management surface, no tenant-context bootstrap
+problem to solve) and `users.is_verified` (backfilled `true` for
+every account that existed before this slice — they were working
+fine without it, and suddenly nudging them for something that wasn't
+a requirement when they signed up would be a regression, not an
+improvement). Signup generates a token and returns the verification
+link directly in the response (same dev-mode stand-in for real email
+delivery as invites and password reset), `POST /auth/verify-email`,
+and a rate-limited `POST /auth/resend-verification`.
+
+**Soft-nudge, not a gate — and the reasoning is specific to this
+app's threat model, not a general "verification is optional"
+stance.** The instinct with email verification is usually to block
+until it's done, because that's the default for public consumer
+apps where an unverified account is a stranger with no established
+relationship to anyone else on the platform — verification is doing
+real work there, screening out throwaway/bot signups before they can
+touch anything. Wrkbase's actual security boundary is somewhere
+else entirely: Row-Level Security enforces tenant isolation at the
+database, and that enforcement doesn't know or care whether
+`is_verified` is true — an unverified user is exactly as isolated
+from every other org's data as a verified one, because the isolation
+is architectural, not identity-gated. Blocking an unverified user
+from creating a project or a ticket wouldn't be closing a real gap in
+this app; it would be adding friction against a cross-tenant risk
+that doesn't exist here, modeled on a threat this app's actual
+security mechanism doesn't share. What verification *does* still
+protect against — losing account recovery because the email on file
+is a typo or was never real — is real, but it's a self-inflicted
+UX cost the account owner bears alone, not a risk to anyone else,
+which is exactly the class of problem a persistent nudge fits and a
+hard lockout over-solves. Proven directly in
+`verify_email_verification.py`, not just asserted: a freshly
+signed-up, still-unverified user creates a project and a ticket over
+real HTTP with no special-casing anywhere in the request path.
+
+**Invite-redemption is auto-verified — and the reason is a stronger
+claim than "it avoids redundant friction."** A self-click
+verification link proves exactly one thing: whoever clicked it
+controls that inbox right now. That's a real but narrow fact —
+it says nothing about whether the person is who they claim to be
+relative to anyone else, because nobody else was involved in the
+decision to let them in. An invite redemption proves something
+categorically different: an already-authenticated admin, already
+inside the org, made a deliberate decision to grant *this specific
+person* access, and `_redeem_invite`'s email-binding check (see
+Slice 6) means the invite can only be redeemed by whoever controls
+the *exact* address that admin chose — not "some inbox," but the one
+the admin picked on purpose. That's a human vouching for another
+human, which is a fundamentally different and stronger kind of trust
+than a bot-or-not inbox check — self-click verification is a floor
+under an otherwise-anonymous signup; an invite is a ceiling an admin
+already applied. Requiring both wouldn't add security, it would
+just fail to recognize that the stronger check already happened.
+This is also the thing that makes the soft-nudge decision above hold
+together end to end: because invited users — very likely the
+majority of real accounts on a team tool, after the first admin
+signs up — are auto-verified, "unverified" ends up describing almost
+exclusively the first user of a brand-new org, someone with no one
+else yet depending on them either way.
+
+**Resend invalidates the prior token immediately; password reset
+lets several coexist. Different by design, and the reasoning is
+about what each token is actually *for*, not an arbitrary choice.**
+Password reset's coexistence tolerance exists because a reset is
+requested under real pressure — locked out, unsure which device
+still has the email, possibly trying more than once because the
+first attempt seemed to not arrive. Every one of those requests
+represents the *same* legitimate need, and whichever token the user
+actually manages to use should work — invalidating an earlier one
+the moment a second is requested would mean a user who re-requests
+"just in case" can accidentally kill the link sitting unread in a
+tab on their other device, adding friction to the exact moment
+friction is most costly, for zero security gain (redemption already
+requires the token itself, so an old token being *also* valid isn't
+a weaker guarantee, just a more forgiving one). Verification doesn't
+share that pressure: it's a one-time, low-stakes state flip with no
+adversarial pressure and no "which device" ambiguity worth
+preserving, and clicking "resend" is a near-explicit signal that the
+previous link is considered dead by the person who requested the new
+one. Keeping the old one alive anyway would only mean more valid,
+unused tokens sitting in old emails and browser history for a
+feature where the cost of being wrong about that (having to click
+resend again) is under a second. The two policies aren't in tension —
+each is the right shape for what that specific token is protecting,
+and it's the same underlying distinction as the soft-nudge decision
+above: password reset guards something that actually matters if
+gotten wrong; verification doesn't.
+
+**Two Turbopack failures this slice's regression pass hit that
+looked identical but weren't.** Both surfaced as the same symptom —
+`tsc --noEmit` failing on a syntactically broken
+`.next/dev/types/validator.ts` — and both were "fixed" by deleting
+that generated directory, which is exactly why it would have been
+easy to file them as the same bug. They weren't. The first was
+ordinary cache staleness: the dev server's generated route-type file
+hadn't caught up with routes that had moved or been added, the same
+category of issue this project has hit repeatedly since the design-
+system slice, normally cleared by a full `--force-recreate -V` and
+a fresh compile. The second, hit later in the same session, produced
+a *corrupted* file, not a stale one — inspecting it directly showed
+genuinely duplicated, interleaved fragments mid-file (part of one
+route's validation block spliced into the middle of another's), the
+signature of a torn write: several `curl` warm-up requests fired in
+quick succession triggered concurrent regeneration of the same
+generated file, and two writers landed on top of each other. The fix
+for the second case wasn't "recreate the container" (staleness's
+fix) — the container was already fresh — it was deleting the
+corrupted `.next/dev/types` directory and warming the routes
+*sequentially*, one request at a time, so regeneration never raced
+itself again. Same visible failure, same file, genuinely different
+root cause, genuinely different fix.
+
+**Verified.** `verify_email_verification.py` (new; wired into CI
+right after `verify_password_reset.py`): the soft-nudge behavior
+proven by actually creating a project and a ticket as an unverified
+user, invite-redemption's auto-verify with no token generated at
+all, reuse and backdated-expiry rejection (the same deliberate,
+named exception to the real-HTTP-only proof-script convention as
+password reset — no HTTP call can fast-forward `email_verification_
+expire_hours`), and resend's immediate invalidation proven by
+requesting twice and confirming the *older* token specifically stops
+working, not just that the newer one succeeds. Full nine-script
+backend regression, `ruff`, and `pip-audit` all clean; frontend
+`ESLint`, `tsc --noEmit`, and a full `next build` clean with
+`/verify-email` registered.

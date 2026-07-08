@@ -4,6 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { useAuth } from "../../lib/auth-context";
 import ThemeToggle from "../../components/ThemeToggle";
+import VerificationBanner from "../../components/VerificationBanner";
 
 // First letter of up to two words, uppercased — a compact stand-in for an
 // org "logo" until orgs have real ones. Deliberately separate from
@@ -89,6 +90,8 @@ export default function ShellLayout({ children }: { children: React.ReactNode })
           </div>
         )}
       </header>
+
+      {user && !user.isVerified && <VerificationBanner email={user.email} />}
 
       {/* Nav collapses off the top bar under md; surfaced here instead so
           it's still one tap away rather than hidden in an unbuilt menu. */}

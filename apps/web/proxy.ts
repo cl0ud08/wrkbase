@@ -12,7 +12,11 @@ import type { NextRequest } from "next/server";
 // them while a session is active elsewhere — e.g. clicking an old reset
 // email on a second device that's still logged in — and redirecting that
 // away would just break the confirm-token flow for no real security gain.
-const ALWAYS_PUBLIC_PATHS = ["/", "/forgot-password", "/reset-password"];
+// /verify-email is public for the same reason: it's routinely opened
+// from an email client that may not share a session with the browser
+// that signed up, and verification isn't gated on being logged in anyway
+// (see User.is_verified's docstring — soft-nudge, not a gate).
+const ALWAYS_PUBLIC_PATHS = ["/", "/forgot-password", "/reset-password", "/verify-email"];
 const LOGGED_OUT_ONLY_PATHS = ["/login", "/signup"];
 
 // Next.js 16 renamed the `middleware.ts` file convention to `proxy.ts`
