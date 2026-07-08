@@ -381,3 +381,37 @@ class InviteLookup(Base):
         nullable=False,
         unique=True,
     )
+
+
+class PasswordResetToken(Base):
+    """A single-use, short-lived credential for resetting one user's own
+    password. Deliberately has no org_id and no RLS — unlike Invite, this
+    table has no authenticated, org-scoped management surface (no "list my
+    org's outstanding reset tokens" view exists or is needed), so it never
+    faces the chicken-and-egg problem RLS-protected tables have of needing
+    a tenant context before they can be queried. It's structurally closer
+    to UserLookup/InviteLookup (bootstrap-only, globally queryable by an
+    unguessable key) than to Invite itself. See app/api/auth.py's
+    confirm_password_reset for how org_id is recovered — via UserLookup's
+    unique user_id index — once it's actually needed, at the point the
+    RLS-protected `users` row has to be updated.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    # CASCADE, same as UserLookup: a token for a user who's since been
+    # removed from their org is meaningless and should simply vanish, not
+    # need special-case handling at confirm time.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # Opaque random token (secrets.token_urlsafe), same reasoning as
+    # invite/refresh tokens — see app/api/invites.py's create_invite for
+    # the full "why not a JWT" writeup, which applies identically here.
+    token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))

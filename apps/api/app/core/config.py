@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     # link returned by POST /invites.
     frontend_url: str = "http://localhost:3000"
     invite_expire_days: int = 7
+    # Deliberately much shorter than an invite: a password-reset token is
+    # meant to be used within minutes of requesting it, not shared or
+    # revisited days later — the shorter the window, the smaller a leaked
+    # or intercepted reset link's blast radius.
+    password_reset_expire_minutes: int = 45
 
     # Connects as the least-privilege `wrkbase_app` role (see migration 0001),
     # never as the Postgres superuser used to run migrations.

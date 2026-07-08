@@ -1,9 +1,10 @@
+import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from slowapi.util import get_remote_address
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,10 +18,33 @@ from app.core.security import (
     verify_password,
 )
 from app.core.ticket_prefix import derive_ticket_prefix
-from app.db.models import Invite, InviteLookup, Organization, User, UserLookup, UserRole
+from app.db.models import (
+    Invite,
+    InviteLookup,
+    Organization,
+    PasswordResetToken,
+    User,
+    UserLookup,
+    UserRole,
+)
 from app.db.session import get_db, set_tenant_context
-from app.schemas.auth import LoginRequest, LogoutRequest, RefreshRequest, SignupRequest, TokenPair
-from app.services.refresh_tokens import pop_refresh_token, revoke_refresh_token, store_refresh_token
+from app.schemas.auth import (
+    LoginRequest,
+    LogoutRequest,
+    PasswordResetConfirm,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
+    RefreshRequest,
+    SignupRequest,
+    TokenPair,
+)
+from app.services.refresh_tokens import (
+    pop_refresh_token,
+    revoke_all_refresh_tokens_for_user,
+    revoke_refresh_token,
+    store_refresh_token,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -29,6 +53,9 @@ _INVALID_CREDENTIALS = HTTPException(
 )
 _INVALID_INVITE = HTTPException(
     status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid, expired, or already-used invite link"
+)
+_INVALID_RESET_TOKEN = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid, expired, or already-used reset link"
 )
 
 
@@ -251,6 +278,133 @@ async def logout(
         await revoke_refresh_token(refresh_token)
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
+
+
+@router.post("/password-reset/request", response_model=PasswordResetRequestResponse)
+# Stricter than login/signup's 10/minute: this is a strictly worse target
+# for abuse than a credential check — a caller doesn't even need to guess
+# anything to spam it, just enumerate/guess emails, and a "successful"
+# spam here means an inbox full of unwanted reset links, not just a
+# rejected login attempt.
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def request_password_reset(
+    request: Request, payload: PasswordResetRequest, db: AsyncSession = Depends(get_db)
+) -> PasswordResetRequestResponse:
+    # Enumeration prevention: this endpoint must be observably identical
+    # (status code, response shape, response content) whether or not
+    # payload.email belongs to a real account — otherwise it becomes a
+    # free oracle for "is this email registered," which is exactly the
+    # kind of information a credential-stuffing or targeted-phishing
+    # campaign wants. A naive fix — return reset_link only when the
+    # account exists, omit/null it otherwise — would still leak the
+    # answer through the *presence* of that field, which defeats the
+    # point while looking secure. Instead: a token is generated
+    # unconditionally, on every call, but it's only ever persisted (and
+    # therefore only ever valid) when the email resolves to a real user.
+    # The response always contains a plausible-looking reset_link either
+    # way. An unpersisted token fails at confirm_password_reset with
+    # exactly the same "invalid or expired" 400 a genuinely expired or
+    # already-used token gets — there is no observable difference between
+    # "this email doesn't exist" and "this link already expired," which is
+    # the actual property that matters. (What's *not* fully solved here:
+    # the found-branch does one extra DB write the not-found branch
+    # doesn't, a small residual timing signal — not equalized, an
+    # acknowledged gap rather than a solved one.)
+    token = secrets.token_urlsafe(32)
+
+    lookup_result = await db.execute(select(UserLookup).where(UserLookup.email == payload.email))
+    lookup = lookup_result.scalar_one_or_none()
+    if lookup is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=settings.password_reset_expire_minutes
+        )
+        db.add(PasswordResetToken(user_id=lookup.user_id, token=token, expires_at=expires_at))
+        await db.commit()
+
+    return PasswordResetRequestResponse(
+        # Dev-mode-only shortcut, same limitation as invites (see
+        # create_invite): real email delivery is out of scope, so the link
+        # is handed back directly instead of sent out-of-band. Unlike
+        # invites, this endpoint is unauthenticated and public, which is
+        # exactly why the token-existence trick above matters here and
+        # didn't need to for invites (created by an already-authenticated
+        # admin who supplies the target email on purpose).
+        reset_link=f"{settings.frontend_url}/reset-password?token={token}"
+    )
+
+
+@router.post("/password-reset/confirm", response_model=PasswordResetConfirmResponse)
+async def confirm_password_reset(
+    payload: PasswordResetConfirm, db: AsyncSession = Depends(get_db)
+) -> PasswordResetConfirmResponse:
+    result = await db.execute(
+        select(PasswordResetToken).where(PasswordResetToken.token == payload.token)
+    )
+    reset_token = result.scalar_one_or_none()
+    if (
+        reset_token is None
+        or reset_token.used_at is not None
+        or reset_token.expires_at < datetime.now(timezone.utc)
+    ):
+        raise _INVALID_RESET_TOKEN
+
+    # Same two-step pre-auth bootstrap shape as login()/redeem_invite():
+    # this endpoint is unauthenticated, so there's no tenant context yet,
+    # and PasswordResetToken carries no org_id of its own (see its model
+    # docstring) — UserLookup's unique index on user_id is what recovers
+    # it, the same way UserLookup's primary key on email does for login.
+    lookup_result = await db.execute(
+        select(UserLookup).where(UserLookup.user_id == reset_token.user_id)
+    )
+    lookup = lookup_result.scalar_one_or_none()
+    if lookup is None:
+        # The user was removed after requesting a reset but before using
+        # it. Treated identically to an expired/invalid token, not a
+        # distinct error — a distinct message here would itself be a
+        # (smaller, authenticated-token-gated) enumeration leak.
+        raise _INVALID_RESET_TOKEN
+
+    await set_tenant_context(db, lookup.org_id)
+    user_result = await db.execute(select(User).where(User.id == reset_token.user_id))
+    user = user_result.scalar_one_or_none()
+    if user is None:
+        raise _INVALID_RESET_TOKEN
+
+    user.hashed_password = await hash_password(payload.new_password)
+    reset_token.used_at = datetime.now(timezone.utc)
+    # Every other still-live token for this user is invalidated too, not
+    # just this one: someone who requested a reset three times (maybe
+    # they lost the first two links) shouldn't leave two still-valid
+    # reset links lying around in old emails/browser history after
+    # they've already reset via the third.
+    await db.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == reset_token.user_id,
+            PasswordResetToken.id != reset_token.id,
+            PasswordResetToken.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(timezone.utc))
+    )
+    await db.commit()
+
+    # The actual point of this endpoint, not an afterthought: without this,
+    # changing your password does nothing to a session an attacker already
+    # has. If someone stole a refresh token — a synced browser profile on
+    # a shared/stolen device, a session cookie leaked some other way —
+    # they never needed the password at all, and rotation (see refresh()
+    # above) only forces THEM to keep refreshing to stay logged in, which
+    # they can do indefinitely without ever knowing the password. A user
+    # who notices something's wrong and resets their password would, with
+    # no revocation, walk away believing they'd secured the account while
+    # the attacker's session keeps working completely unaffected — the
+    # reset would have changed nothing an attacker actually needed. Done
+    # AFTER the commit, not before, same ordering as remove_member in
+    # app/api/org.py: if the commit had failed, revoking every session
+    # first would lock out someone whose password never actually changed.
+    await revoke_all_refresh_tokens_for_user(user.id)
+
+    return PasswordResetConfirmResponse()
 
 
 @router.get("/me")
