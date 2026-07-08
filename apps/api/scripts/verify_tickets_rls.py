@@ -206,6 +206,105 @@ async def main() -> None:
         assert unassign_resp.json()["assignee_id"] is None
         print("PASS: unassigning a ticket (assignee_id: null) succeeds")
 
+        # --- soft-delete: children-exist check still blocks it -----------------
+        # epic -> story -> good_subtask still forms a live chain at this
+        # point. Soft-delete never issues a hard DELETE, so the old
+        # FK-RESTRICT-triggered IntegrityError can't fire anymore — this is
+        # proving the *replacement* explicit check (_has_active_children)
+        # actually blocks it, not just trusting the old mechanism still
+        # applies.
+        blocked_delete_epic = await client.delete(
+            f"/projects/{project_a['id']}/tickets/{epic['id']}", headers=auth_headers(token_a)
+        )
+        assert blocked_delete_epic.status_code == 409, (
+            f"expected 409, got {blocked_delete_epic.status_code}"
+        )
+        print("PASS: soft-deleting a ticket with active children is still blocked (409)")
+
+        # --- soft-delete a leaf: excluded from get/list/tree --------------------
+        subtask_id = good_subtask.json()["id"]
+        delete_subtask = await client.delete(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}", headers=auth_headers(token_a)
+        )
+        assert delete_subtask.status_code == 204, f"expected 204, got {delete_subtask.status_code}"
+
+        get_deleted = await client.get(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}", headers=auth_headers(token_a)
+        )
+        assert get_deleted.status_code == 404, "a soft-deleted ticket should 404 for its own org too"
+
+        list_after = await client.get(
+            f"/projects/{project_a['id']}/tickets", headers=auth_headers(token_a)
+        )
+        list_after.raise_for_status()
+        assert subtask_id not in {t["id"] for t in list_after.json()}, (
+            "a soft-deleted ticket should not appear in the list"
+        )
+
+        tree_after = await client.get(
+            f"/projects/{project_a['id']}/tickets/tree", headers=auth_headers(token_a)
+        )
+        tree_after.raise_for_status()
+
+        def _find(nodes: list[dict], target_id: str) -> dict | None:
+            for node in nodes:
+                if node["id"] == target_id:
+                    return node
+                found = _find(node["children"], target_id)
+                if found is not None:
+                    return found
+            return None
+
+        assert _find(tree_after.json(), subtask_id) is None, (
+            "a soft-deleted ticket should not appear in /tree either"
+        )
+        print("PASS: a soft-deleted ticket is excluded from GET/list/tree for its own org, not just hidden from other orgs")
+
+        # now that its only child is soft-deleted, the story can be deleted too
+        delete_story = await client.delete(
+            f"/projects/{project_a['id']}/tickets/{story['id']}", headers=auth_headers(token_a)
+        )
+        assert delete_story.status_code == 204, f"expected 204, got {delete_story.status_code}"
+        print("PASS: once its only child is soft-deleted, the parent can be soft-deleted too")
+
+        # --- RLS still applies to a soft-deleted row, not just an active one ---
+        # get/list/tree above already prove exclusion for org A's own view;
+        # this proves org B specifically can't reach the same soft-deleted
+        # row either -- most interestingly via restore, brand-new code with
+        # no prior cross-org coverage at all.
+        cross_get_deleted = await client.get(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}", headers=auth_headers(token_b)
+        )
+        assert cross_get_deleted.status_code == 404, f"expected 404, got {cross_get_deleted.status_code}"
+
+        cross_restore = await client.post(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}/restore", headers=auth_headers(token_b)
+        )
+        assert cross_restore.status_code == 404, f"expected 404, got {cross_restore.status_code}"
+        print(
+            "PASS: RLS still applies to a soft-deleted row -- org B can't see or restore "
+            "org A's soft-deleted ticket"
+        )
+
+        # --- restore works, for the rightful owner -------------------------------
+        restore_resp = await client.post(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}/restore", headers=auth_headers(token_a)
+        )
+        restore_resp.raise_for_status()
+        assert restore_resp.json()["deleted_at"] is None
+        get_after_restore = await client.get(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}", headers=auth_headers(token_a)
+        )
+        assert get_after_restore.status_code == 200, f"expected 200, got {get_after_restore.status_code}"
+        print("PASS: restoring a soft-deleted ticket makes it visible again")
+
+        # restoring an already-active ticket is a clean 400, not a silent no-op
+        restore_again = await client.post(
+            f"/projects/{project_a['id']}/tickets/{subtask_id}/restore", headers=auth_headers(token_a)
+        )
+        assert restore_again.status_code == 400, f"expected 400, got {restore_again.status_code}"
+        print("PASS: restoring a ticket that isn't deleted is rejected (400), not a silent no-op")
+
     print("\nAll ticket tenant-isolation and hierarchy checks passed.")
 
 

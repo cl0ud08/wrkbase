@@ -28,3 +28,6 @@ class ProjectRead(BaseModel):
     created_by: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+    # Not settable via ProjectUpdate — only DELETE/{id}/restore touch this,
+    # so it can't be bypassed via a plain PATCH.
+    deleted_at: datetime | None

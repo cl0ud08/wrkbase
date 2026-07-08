@@ -1,8 +1,8 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
@@ -31,24 +31,45 @@ _TICKET_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=
 _COLLABORATIVE_FIELDS = {"workflow_state_id", "position", "assignee_id"}
 
 
-async def _get_project_or_404(db: AsyncSession, project_id: uuid.UUID) -> Project:
+async def _get_project_or_404(
+    db: AsyncSession, project_id: uuid.UUID, *, include_deleted: bool = False
+) -> Project:
     # Same shape as projects.py's helper: RLS already scopes this to the
     # caller's org, so a project id from another org is indistinguishable
-    # from one that doesn't exist.
-    result = await db.execute(select(Project).where(Project.id == project_id))
+    # from one that doesn't exist. deleted_at IS NULL filtered by default
+    # for the same reason as projects.py's copy of this helper — every
+    # ticket endpoint in this file scopes through this function first, so
+    # a soft-deleted project makes its entire ticket subtree unreachable
+    # through the normal /projects/{id}/tickets/... paths in one place,
+    # with no per-endpoint filtering to remember. include_deleted is used
+    # nowhere in this file today (a ticket's own restore only needs the
+    # TICKET looked up with include_deleted, not its project — see
+    # restore_ticket) but matches projects.py's helper shape for
+    # consistency and in case a future endpoint needs it.
+    query = select(Project).where(Project.id == project_id)
+    if not include_deleted:
+        query = query.where(Project.deleted_at.is_(None))
+    result = await db.execute(query)
     project = result.scalar_one_or_none()
     if project is None:
         raise _PROJECT_NOT_FOUND
     return project
 
 
-async def _get_ticket_or_404(db: AsyncSession, project_id: uuid.UUID, ticket_id: uuid.UUID) -> Ticket:
+async def _get_ticket_or_404(
+    db: AsyncSession, project_id: uuid.UUID, ticket_id: uuid.UUID, *, include_deleted: bool = False
+) -> Ticket:
     # Scoped by project_id, not just id: a ticket id that's real but
     # belongs to a *different* project in the same org must also 404, not
-    # leak across projects within one tenant.
-    result = await db.execute(
-        select(Ticket).where(Ticket.id == ticket_id, Ticket.project_id == project_id)
-    )
+    # leak across projects within one tenant. deleted_at IS NULL filtered
+    # by default — this is the one place every ticket-by-id lookup in this
+    # file goes through, so this single filter covers get/update/delete
+    # all at once. include_deleted=True is used only by restore_ticket,
+    # which specifically needs to find a currently-soft-deleted row.
+    query = select(Ticket).where(Ticket.id == ticket_id, Ticket.project_id == project_id)
+    if not include_deleted:
+        query = query.where(Ticket.deleted_at.is_(None))
+    result = await db.execute(query)
     ticket = result.scalar_one_or_none()
     if ticket is None:
         raise _TICKET_NOT_FOUND
@@ -76,9 +97,15 @@ async def _validate_parent(
     # level, that IF this insert/update succeeds, parent_id really is a
     # ticket in this same project. This check runs first anyway so a bad
     # parent_id gets a clean 422 with a real message instead of surfacing
-    # as a raw IntegrityError.
+    # as a raw IntegrityError. deleted_at IS NULL is part of this query
+    # too: the FK itself can't express "not soft-deleted" (see migration
+    # 0010), so a soft-deleted ticket has to be rejected as a parent here,
+    # at the app layer — it simply doesn't turn up in this query, so it
+    # hits the exact same 422 a genuinely nonexistent parent_id would.
     result = await db.execute(
-        select(Ticket).where(Ticket.id == parent_id, Ticket.project_id == project_id)
+        select(Ticket).where(
+            Ticket.id == parent_id, Ticket.project_id == project_id, Ticket.deleted_at.is_(None)
+        )
     )
     parent = result.scalar_one_or_none()
     if parent is None:
@@ -208,7 +235,9 @@ async def list_tickets(
 ) -> list[Ticket]:
     await _get_project_or_404(db, project_id)
     result = await db.execute(
-        select(Ticket).where(Ticket.project_id == project_id).order_by(Ticket.created_at)
+        select(Ticket)
+        .where(Ticket.project_id == project_id, Ticket.deleted_at.is_(None))
+        .order_by(Ticket.created_at)
     )
     return list(result.scalars().all())
 
@@ -226,7 +255,9 @@ async def get_ticket_tree(
     # first or this would 422 as an invalid ticket id instead of running.
     await _get_project_or_404(db, project_id)
     result = await db.execute(
-        select(Ticket).where(Ticket.project_id == project_id).order_by(Ticket.created_at)
+        select(Ticket)
+        .where(Ticket.project_id == project_id, Ticket.deleted_at.is_(None))
+        .order_by(Ticket.created_at)
     )
     tickets = list(result.scalars().all())
 
@@ -293,6 +324,21 @@ async def update_ticket(
     return ticket
 
 
+async def _has_active_children(db: AsyncSession, ticket_id: uuid.UUID) -> bool:
+    # Under hard-delete this check was implicit: fk_tickets_parent_project
+    # is ON DELETE RESTRICT, so attempting to delete a ticket with children
+    # raised IntegrityError, caught and turned into a 409. Soft-delete
+    # never issues a DELETE statement at all — the row stays put, so that
+    # FK never fires, and the check has to become an explicit query
+    # instead. Deliberately checks for *non-deleted* children only: a
+    # ticket whose only children are themselves already soft-deleted is
+    # fine to soft-delete, same as a ticket that never had children.
+    result = await db.execute(
+        select(exists().where(Ticket.parent_id == ticket_id, Ticket.deleted_at.is_(None)))
+    )
+    return bool(result.scalar())
+
+
 @router.delete("/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ticket(
     project_id: uuid.UUID,
@@ -303,12 +349,48 @@ async def delete_ticket(
     await _get_project_or_404(db, project_id)
     ticket = await _get_ticket_or_404(db, project_id, ticket_id)
     _require_owner_or_admin(ticket, auth)
-    try:
-        await db.delete(ticket)
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
+
+    # Same rule as before soft-delete, still enforced, just by a different
+    # mechanism (see _has_active_children): soft-deleting a ticket that
+    # still has live children would leave the /tree view with children
+    # whose parent has vanished from the default view — an orphaned-
+    # looking subtree, not a genuinely broken reference (the row and its
+    # composite FK are both still intact), but confusing and avoidable.
+    if await _has_active_children(db, ticket_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot delete a ticket that has children — delete or reassign them first",
         )
+
+    ticket.deleted_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
+@router.post("/{ticket_id}/restore", response_model=TicketRead)
+async def restore_ticket(
+    project_id: uuid.UUID,
+    ticket_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> Ticket:
+    # The project itself is looked up WITHOUT include_deleted: restoring a
+    # ticket under a still-soft-deleted project is deliberately blocked by
+    # this 404, not specially handled — the project has to be restored
+    # first. Consistent with a soft-deleted project hiding its entire
+    # ticket subtree as one unit; restoring one ticket into a project
+    # nobody can currently see wouldn't accomplish much anyway.
+    await _get_project_or_404(db, project_id)
+    ticket = await _get_ticket_or_404(db, project_id, ticket_id, include_deleted=True)
+    _require_owner_or_admin(ticket, auth)
+    if ticket.deleted_at is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ticket is not deleted")
+
+    # No re-validation of parent_id here on purpose: if the parent is
+    # itself still soft-deleted (or was deleted since), get_ticket_tree
+    # already degrades gracefully — a restored ticket whose parent isn't
+    # in the visible set simply renders as a root instead of nesting,
+    # self-healing once the parent is restored too on a later fetch,
+    # rather than needing new blocking logic here.
+    ticket.deleted_at = None
+    await db.commit()
+    return ticket

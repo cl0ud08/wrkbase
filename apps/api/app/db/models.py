@@ -126,6 +126,15 @@ class Project(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()
     )
+    # Soft-delete (migration 0010). NULL = active. Set directly by
+    # application code (DELETE /projects/{id}), not a trigger — no
+    # eager_defaults wrinkle here the way updated_at has, since the value
+    # is already known in Python before commit, not computed server-side.
+    # Every read path filters this to NULL by default (see
+    # app/api/projects.py's _get_project_or_404/list_projects) — see that
+    # file for why this is an explicit app-layer filter rather than an
+    # RLS-style unconditional policy.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class WorkflowState(Base):
@@ -217,6 +226,12 @@ class Ticket(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()
     )
+    # Same soft-delete shape as Project.deleted_at above (migration 0010),
+    # same reasoning. A ticket with live (non-deleted) children can't be
+    # soft-deleted — see delete_ticket in app/api/tickets.py — so by the
+    # time a ticket's deleted_at is actually set, it's guaranteed to have
+    # no visible children left to orphan in the /tree view.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Invite(Base):

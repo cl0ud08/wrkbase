@@ -883,3 +883,125 @@ getting subtly wrong in YAML with no local way to test it before
 pushing. A plain `run:` step invoking the exact command already run
 and verified locally has no such uncertainty — same image, same flags,
 nothing trusted blind.
+
+---
+
+## Slice 15 — Soft-delete for projects and tickets
+
+**Built:** `deleted_at` (migration 0010) on both tables, every read path
+updated to exclude soft-deleted rows by default, `DELETE` endpoints
+that set `deleted_at` instead of removing the row, a `POST
+.../restore` endpoint for each resource with the same authorization as
+delete, and proof-script coverage for all of it. Groundwork for the
+audit-log work coming next: "this was deleted" becomes a fact that can
+be logged and undone, not an event that erases its own evidence.
+
+**The composite-FK question — a foreign key can't see `deleted_at` at
+all, so the answer has to live somewhere else.** A Postgres FK
+constraint only ever asserts "a row with this key exists" — it
+references a unique/PK constraint, not an arbitrary predicate, so
+there's no way to write `REFERENCES projects(id, org_id) WHERE
+deleted_at IS NULL`. `fk_tickets_project_org` and
+`fk_tickets_parent_project` stay exactly as they were in migrations
+0005/0006, unmodified — structurally, nothing stops a ticket's
+`project_id` or `parent_id` from pointing at a row that's since been
+soft-deleted. The composite FK's job was never "block references to
+deleted rows"; it was always "block references to rows in the *wrong
+org/project*," and that job is unaffected. Whether a soft-deleted
+project/parent can be validly *referenced going forward* is answered at
+the app layer instead — and it turns out to need no new logic at all:
+`_get_project_or_404` and `_validate_parent`'s existence check both
+already filter `deleted_at IS NULL` (see below), so a soft-deleted
+project or parent simply fails to turn up in those same queries,
+producing the exact same 404/422 a genuinely nonexistent id already
+would. The exclusion filter and the "can't reference a deleted row"
+rule are the same mechanism, not two things to keep in sync.
+
+**Where "exclude soft-deleted by default" lives — the genuinely new
+decision, and it comes out differently than RLS.** Explicit
+`.where(Model.deleted_at.is_(None))` in each read-path query — mostly
+concentrated in the small number of chokepoint helpers
+(`_get_project_or_404`, `_get_ticket_or_404`, `_validate_parent`) every
+endpoint already funnels through, plus the two/three queries
+(`list_projects`, `list_tickets`, `get_ticket_tree`) that don't. Not a
+database-level mechanism the way RLS is. The RLS argument was: don't
+trust every query, present and future, to remember a `WHERE org_id =
+...` clause, because forgetting it even once is a cross-tenant data
+leak — a trust/compliance failure, and RLS's rule has to be
+*unconditional*, applying to literally every query against that table
+with zero legitimate exceptions. Soft-delete doesn't share either
+property. First, the stakes are lower: forgetting the filter means a
+user briefly sees their *own* org's own data in a stale state
+("why is my deleted ticket still showing") — a correctness bug, not a
+trust boundary crossed. Second, and more structurally decisive: **the
+filter needs a legitimate, deliberate exception**, and RLS-style
+policies don't have a clean way to express one. The restore endpoint's
+entire job is finding a row *specifically because* it's soft-deleted —
+if this filter lived as an unconditional DB policy the way RLS does,
+restore would need its own bypass mechanism (a second policy, a
+role check, a session flag mirroring `app.current_org_id`) just to
+counteract the first policy, real added complexity to solve a
+lower-stakes problem. An explicit per-query `.where()` clause instead
+just doesn't get added on the one call site that deliberately doesn't
+want it (`_get_project_or_404(..., include_deleted=True)`), no
+counter-mechanism required. This is genuinely a different answer than
+RLS got, not RLS's reasoning quietly reapplied — and it's not a novel
+pattern for this codebase either: project_id scoping within an org was
+already handled the same explicit, app-layer way (backed by composite
+FKs for structural correctness), for the same reason — RLS's
+"unconditional, no exceptions" bar doesn't fit every scoping problem
+this app has, only the tenant-isolation one.
+
+**The children-exist check's *mechanism* changed even though its
+*outcome* didn't.** Under hard-delete, `fk_tickets_parent_project` is
+`ON DELETE RESTRICT` — attempting to delete a ticket with children
+raised a real `IntegrityError`, caught and turned into a 409. That
+entire mechanism stops working under soft-delete: soft-deleting a
+ticket never issues a `DELETE` statement, so the FK's `RESTRICT` clause
+never has anything to fire on. The check has to become an explicit,
+proactive query instead (`_has_active_children`, checking for
+non-deleted children specifically), run *before* setting `deleted_at`,
+not reacted to after the fact. Still blocks the exact same case for the
+exact same reason: soft-deleting a ticket with live children would
+leave `/tree` rendering children whose parent has vanished from the
+default view. A ticket whose only children are *already* soft-deleted
+is fine to soft-delete — proven directly in the proof script (delete
+the leaf subtask, then the previously-blocked epic delete succeeds).
+
+**Project archiving: decided to be a genuinely separate concept from
+soft-delete, not built in this slice.** Mechanically they look
+identical — hide by default, need an explicit action to undo — which
+makes reusing `deleted_at` tempting. The reason not to: `deleted_at` is
+this feature's *cleanup-eligibility* signal — the audit-log/retention
+work this slice explicitly sets up for will eventually want to answer
+"what's been soft-deleted long enough to purge for good," and an
+archived project is never supposed to be eligible for that, no matter
+how old. Reusing the same column would mean "archive" and "mark for
+eventual deletion" become indistinguishable to any future retention
+job, a foot-gun that wouldn't show up until that job actually ships and
+starts purging things nobody meant to lose. `deleted_at` says *this
+might go away*; archiving needs to say *this is done, keep it
+forever*, and those are different enough claims to deserve different
+columns whenever archiving actually gets built. Not building it now:
+the ask here was to decide whether it overlaps with soft-delete, not to
+ship the feature, and adding an `archived_at` column with no endpoint
+using it yet would just be dead schema sitting around unused — the
+same "don't add reflexively" instinct that kept `eager_defaults` off
+`WorkflowState` in an earlier slice.
+
+**Verified, not just built.** Both proof scripts gained soft-delete
+coverage: excluded from get/list/tree for the *same* org (not just
+hidden from other orgs, which was already true and proves nothing new
+about soft-delete specifically), the children-exist check still
+blocking with the new mechanism, restore actually working, restoring
+an already-active resource rejected with a clean 400 instead of a
+silent no-op, and — the part with real regression risk, since it's
+brand-new code with no prior cross-org coverage at all — a cross-org
+`restore` attempt still 404ing exactly like get/patch/delete already
+did. Soft-deleting a project was also proven to make its tickets
+unreachable as one unit (`GET .../tickets` 404s once the project itself
+is soft-deleted) without touching the tickets' own `deleted_at` at
+all — restoring the project alone brings them straight back, which is
+the archiving-shaped behavior this slice deliberately isn't building a
+separate feature for yet. Full six-script regression, `ruff`, and
+`pip-audit` all re-run clean afterward.

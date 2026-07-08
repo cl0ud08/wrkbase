@@ -51,6 +51,8 @@ class TicketRead(BaseModel):
     assignee_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+    # Not settable via TicketUpdate — only DELETE/{id}/restore touch this.
+    deleted_at: datetime | None
 
 
 class TicketTreeNode(TicketRead):

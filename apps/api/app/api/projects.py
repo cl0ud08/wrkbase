@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -30,12 +31,26 @@ _DEFAULT_WORKFLOW_STATES = [
 ]
 
 
-async def _get_project_or_404(db: AsyncSession, project_id: uuid.UUID) -> Project:
+async def _get_project_or_404(
+    db: AsyncSession, project_id: uuid.UUID, *, include_deleted: bool = False
+) -> Project:
     # RLS already scopes this to the caller's org, so a project ID from
     # another org simply matches zero rows — "doesn't exist" and "exists in
     # another org" are indistinguishable here, on purpose. This endpoint
     # never confirms or denies that some other org's project ID is real.
-    result = await db.execute(select(Project).where(Project.id == project_id))
+    #
+    # deleted_at IS NULL filtered here by default, same status as the
+    # org_id scoping above: this is the single chokepoint every read/write
+    # endpoint in this file already goes through to fetch a project by id,
+    # so adding the filter once here (and once in list_projects, the only
+    # other query in this file) covers every call site — there's no
+    # separate query anyone could forget to add it to. include_deleted
+    # exists for exactly one caller: restore_project, which by definition
+    # needs to find a row that's currently soft-deleted.
+    query = select(Project).where(Project.id == project_id)
+    if not include_deleted:
+        query = query.where(Project.deleted_at.is_(None))
+    result = await db.execute(query)
     project = result.scalar_one_or_none()
     if project is None:
         raise _NOT_FOUND
@@ -88,7 +103,9 @@ async def list_projects(
     # auth.org_id. This is the actual payoff of Phase 0: a brand-new
     # resource gets tenant isolation for free just by going through
     # get_current_auth, with zero tenancy-aware code in this query.
-    result = await db.execute(select(Project).order_by(Project.created_at.desc()))
+    result = await db.execute(
+        select(Project).where(Project.deleted_at.is_(None)).order_by(Project.created_at.desc())
+    )
     return list(result.scalars().all())
 
 
@@ -124,7 +141,31 @@ async def delete_project(
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    # Soft-delete, not db.delete(): the resource stays in the database,
+    # just hidden from every default read path (see _get_project_or_404 /
+    # list_projects above), so it's a recoverable, loggable event rather
+    # than data that's simply gone. An already-soft-deleted project needs
+    # no special-casing here — _get_project_or_404's default deleted_at
+    # filter already makes it invisible, so DELETE on one just 404s the
+    # same way deleting a genuinely nonexistent id always has.
     project = await _get_project_or_404(db, project_id)
     _require_owner_or_admin(project, auth)
-    await db.delete(project)
+    project.deleted_at = datetime.now(timezone.utc)
     await db.commit()
+
+
+@router.post("/{project_id}/restore", response_model=ProjectRead)
+async def restore_project(
+    project_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> Project:
+    # Same authorization as delete — undoing a delete is the same kind of
+    # privileged action as doing it.
+    project = await _get_project_or_404(db, project_id, include_deleted=True)
+    _require_owner_or_admin(project, auth)
+    if project.deleted_at is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Project is not deleted")
+    project.deleted_at = None
+    await db.commit()
+    return project
