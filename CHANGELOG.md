@@ -1631,3 +1631,134 @@ a request carrying no session cookie at all. The literal client-side
 `router.push` navigation itself — the browser's URL bar actually
 changing after a button click — isn't something curl can execute;
 that part was confirmed by hand, in a real browser, not simulated.
+
+---
+
+## Slice 21 — Closing the organizations RLS gap deferred since Slice 2
+
+**Built:** migration `0015`, giving `organizations` its own
+`FORCE ROW LEVEL SECURITY` policies. This table has had none since
+Slice 2 — it's the tenant root, not a tenant-scoped resource, and
+adding a policy for it collided with the login-bootstrap problem
+`user_lookup` was built to solve, so it was deliberately deferred.
+Worth closing now that invites make multi-org membership real: a
+compromised or misused `wrkbase_app` connection could otherwise
+enumerate every organization's name, `ticket_prefix`, and
+`next_ticket_number` with no tenant filtering at all.
+
+**Why the policy predicate is `id`, not `org_id`.** Every other
+RLS-protected table in this app is scoped *by* an `org_id` column
+pointing at `organizations` — the row belongs to a tenant. This table
+has no such column, because a row here *is* a tenant: there's nothing
+for it to point at except itself. So the predicate has to be
+`id = current_org_id` instead of the usual `org_id = current_org_id`.
+It's a one-token difference, but it's the reason this table couldn't
+just reuse the `tenant_isolation` policy shape from `users`/`sprints`/
+everywhere else — the column that "is this row's tenant" is a
+different column here.
+
+**Why one command needed a different shape from the other three.**
+That same `id`-keyed predicate is also why this table needed four
+separate per-command decisions instead of one `USING`+`WITH CHECK`
+pair:
+
+- **SELECT** — scoped (`id = current_org_id`). Org A must never read
+  org B's row by id, the ordinary default-deny case.
+- **UPDATE** — scoped the same way. Grepping every real
+  `organizations` touch point before writing the migration surfaced
+  the one that mattered: `tickets.py`'s `_next_ticket_number()` runs
+  `UPDATE organizations ... RETURNING` on *every single ticket
+  creation*, to atomically bump the per-org ticket counter. Without an
+  UPDATE policy, `FORCE ROW LEVEL SECURITY` defaults to deny for any
+  command with no applicable policy — every ticket creation would have
+  silently broken the moment this migration shipped. Scoping it also
+  means org A can never bump org B's counter, which leaving it
+  permissive would otherwise have allowed.
+- **INSERT** — deliberately left permissive (`WITH CHECK true`).
+  Self-serve signup creates the `Organization` row before any tenant
+  context can exist: the org doesn't have an identity to scope by
+  until it exists. A restrictive check here would make it impossible
+  to ever create the first org. This isn't a workaround — an INSERT
+  can't leak *existing* rows the way SELECT/UPDATE can, and
+  unrestricted self-serve org creation is already this app's
+  intentional behavior; the policy just states that plainly.
+- **DELETE** — left with no policy at all (default-deny under FORCE
+  RLS). No code path in this app ever deletes an organization, so
+  there's nothing to make permissive — and leaving it unpoliced means
+  that stays true even if someone adds a delete path later without
+  thinking about this table specifically.
+
+**The subtle part: Postgres checks `RETURNING` against the SELECT
+policy, even on an INSERT.** This is the real find of this slice, in
+the same spirit as the `NULLIF` GUC bug from Slice 2 — a piece of RLS
+behavior that isn't obvious from the policy's own `USING`/`WITH CHECK`
+clauses and will bite anyone who assumes "permissive INSERT policy"
+means "INSERT always succeeds." SQLAlchemy's Postgres dialect appends
+an implicit `RETURNING` to essentially every INSERT — ORM `session.add()`
+and even a plain Core `insert()` — specifically to read back
+server-generated columns like `id` and `created_at` into the Python
+object. Postgres, in turn, only returns a row from `RETURNING` if that
+row passes the table's applicable **SELECT** policy — not the INSERT
+policy that just permitted the write. So the very first attempt at
+self-serve signup after this migration failed outright:
+`InsufficientPrivilegeError: new row violates row-level security
+policy for table "organizations"`, thrown from the INSERT statement,
+despite `insert_new_org`'s `WITH CHECK (true)` being trivially
+satisfied. The actual failure was the implicit RETURNING trying to
+read the just-inserted row back under `select_own_org`'s
+`id = current_org_id` — and no tenant context existed yet to satisfy
+it, because the org's id wasn't known until the INSERT itself
+completed. Two commands, two different policies, and the one that
+silently mattered wasn't the one anybody would have looked at first.
+
+Fixed by generating the org's UUID client-side
+(`Organization(id=uuid.uuid4(), ...)`) instead of leaving it to the
+column's `gen_random_uuid()` server default, in both `signup()` and
+`scripts/seed.py`, and setting tenant context to that known id
+*before* the insert rather than after. This isn't a hack layered on
+top of the RLS design — it brings `organizations` in line with how
+the `users` insert immediately below it already worked all along
+(context set before the row exists, because `users.org_id` is always
+known up front). Proving the INSERT policy alone, with no tenant
+context at all, needed a genuinely raw SQL `text()` insert in
+`verify_rls.py` — even a bare Core `insert()` against the table
+object still triggers Postgres's dialect-level implicit `RETURNING`
+and hits the exact same wall.
+
+**Traced all three auth entry points, not just login:**
+- **Login** never queries `organizations` directly — it resolves via
+  `user_lookup` (no RLS), unchanged.
+- **Self-serve signup** is the path the RETURNING interaction above
+  actually broke, and the one the client-side-id fix targets.
+- **Signup via invite** resolves the target org through
+  `invite_lookup` (no RLS) before touching `organizations` at all —
+  already correctly ordered, confirmed by direct read and by
+  `verify_invites_rls.py` passing unchanged.
+
+**Extended `verify_rls.py`** (now 9 checks, up from 5) rather than
+adding a separate `verify_organizations_rls.py`: this is core RLS
+mechanics for the foundational table Slice 2 deferred, the same
+category as the existing `users` checks, not a resource-specific
+concern the way `verify_projects_rls.py` etc. are. New checks: org A's
+context can read its own organization row; org A's context reading
+org B's organization row by real id returns zero rows, not an error;
+creating a new organization with no tenant context at all still
+succeeds (the permissive INSERT, proven via raw SQL for the reason
+above); org A's context updating org B's `next_ticket_number` affects
+zero rows, not an error. `get_org_id()`, the script's own setup
+helper, also had to change — it used to query `organizations` by name
+directly with no context set at all, which the new SELECT policy
+would now correctly reject. Resolved via `user_lookup` instead
+(`email -> org_id`, no RLS), the same bootstrap mechanism login itself
+relies on, keyed off each seeded org's known admin email rather than
+the org's name.
+
+**Verified:** migration applied cleanly; all 9 `verify_rls.py` checks
+pass; all 8 other proof scripts (`verify_auth_rls`,
+`verify_email_verification`, `verify_invites_rls`,
+`verify_password_reset`, `verify_projects_rls`, `verify_sprints_rls` —
+including its concurrent race check, which exercises the same
+`_next_ticket_number` UPDATE path this slice's new UPDATE policy
+guards — `verify_tickets_rls`, `verify_workflow_rls`) pass with no
+regressions; `ruff check .` clean; `pip-audit` shows only pre-existing
+`pip`-tool CVEs unrelated to any application dependency.
