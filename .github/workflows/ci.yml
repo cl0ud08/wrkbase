@@ -156,6 +156,16 @@ jobs:
       - name: Verify auth + RLS integration
         run: python -m scripts.verify_auth_rls
 
+      - name: Reset rate limiter (password reset)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Password reset: the enumeration-safe response (identical shape for
+      # a real vs. nonexistent email), reuse/expiry rejection, and the part
+      # with real security consequences if it's wrong — every outstanding
+      # refresh token actually dies on reset, not just the password.
+      - name: Verify password reset
+        run: python -m scripts.verify_password_reset
+
       # First proof that a resource beyond auth inherits tenant isolation
       # for free from the existing get_current_auth + RLS wiring: org A
       # directly GETs/PATCHes org B's real project ID by guessing it, not
