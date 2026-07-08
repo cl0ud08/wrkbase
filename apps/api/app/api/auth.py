@@ -16,6 +16,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.core.ticket_prefix import derive_ticket_prefix
 from app.db.models import Invite, InviteLookup, Organization, User, UserLookup, UserRole
 from app.db.session import get_db, set_tenant_context
 from app.schemas.auth import LoginRequest, LogoutRequest, RefreshRequest, SignupRequest, TokenPair
@@ -135,7 +136,7 @@ async def signup(
     if payload.invite_token:
         org_id, role = await _redeem_invite(db, payload.invite_token, payload.email)
     else:
-        org = Organization(name=payload.org_name)
+        org = Organization(name=payload.org_name, ticket_prefix=derive_ticket_prefix(payload.org_name))
         db.add(org)
         await db.flush()  # organizations has no RLS, so no tenant context needed yet
         await set_tenant_context(db, org.id)
@@ -274,6 +275,9 @@ async def me(
         "email": user.email,
         "org_id": str(user.org_id),
         "org_name": org.name,
+        # Exposed so the frontend can render a ticket's display id
+        # (PREFIX-NUMBER) without a second fetch — see migration 0011.
+        "ticket_prefix": org.ticket_prefix,
         "role": user.role.value,
         "org_user_count": org_user_count,
     }

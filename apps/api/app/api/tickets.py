@@ -2,11 +2,11 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
-from app.db.models import Project, Ticket, TicketType, User, UserRole, WorkflowState
+from app.db.models import Organization, Project, Ticket, TicketType, User, UserRole, WorkflowState
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketRead, TicketTreeNode, TicketUpdate
 
@@ -187,6 +187,22 @@ async def _next_position(db: AsyncSession, workflow_state_id: uuid.UUID) -> floa
     return (max_position or 0.0) + 1024.0
 
 
+async def _next_ticket_number(db: AsyncSession, org_id: uuid.UUID) -> int:
+    # Atomic increment-and-fetch in one statement: Postgres serializes
+    # concurrent UPDATEs to the same row automatically, so two tickets
+    # being created in the same org at the same instant still each get a
+    # distinct, correctly-incremented number — no separate locking needed,
+    # and no race the way a read-then-write (SELECT next_ticket_number,
+    # then UPDATE) would have.
+    result = await db.execute(
+        update(Organization)
+        .where(Organization.id == org_id)
+        .values(next_ticket_number=Organization.next_ticket_number + 1)
+        .returning(Organization.next_ticket_number - 1)
+    )
+    return result.scalar_one()
+
+
 @router.post("", response_model=TicketRead, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     project_id: uuid.UUID,
@@ -210,6 +226,8 @@ async def create_ticket(
     if payload.assignee_id is not None:
         await _validate_assignee(db, auth.org_id, payload.assignee_id)
 
+    ticket_number = await _next_ticket_number(db, auth.org_id)
+
     ticket = Ticket(
         org_id=auth.org_id,
         project_id=project_id,
@@ -220,6 +238,7 @@ async def create_ticket(
         workflow_state_id=workflow_state_id,
         position=position,
         assignee_id=payload.assignee_id,
+        ticket_number=ticket_number,
         created_by=auth.user_id,
     )
     db.add(ticket)

@@ -29,6 +29,16 @@ class Organization(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
+    # Stored, not derived live from `name` (migration 0011): a ticket's
+    # displayed key (PREFIX-NUMBER) is meant to be permanent once assigned.
+    # There's no org-rename endpoint today, so the two are equivalent right
+    # now — stored anyway so a future rename can't silently change every
+    # existing ticket's displayed id.
+    ticket_prefix: Mapped[str] = mapped_column(String(8), nullable=False)
+    # Backing counter for per-org sequential ticket numbers — see
+    # create_ticket in app/api/tickets.py for the atomic
+    # UPDATE ... RETURNING pattern that increments this.
+    next_ticket_number: Mapped[int] = mapped_column(nullable=False, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
 
 
@@ -222,6 +232,10 @@ class Ticket(Base):
     # same reason as created_by: a removed member's tickets are kept, just
     # unassigned, not destroyed or blocked from being removed.
     assignee_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Per-org sequential display id (migration 0011) — combined with the
+    # org's ticket_prefix on the frontend to render "WRK-142". Set once at
+    # creation from Organization.next_ticket_number, never changes after.
+    ticket_number: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()

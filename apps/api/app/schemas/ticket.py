@@ -43,6 +43,11 @@ class TicketRead(BaseModel):
     description: str | None
     workflow_state_id: uuid.UUID
     position: float
+    # Per-org sequential display id (migration 0011) — combine with the
+    # org's ticket_prefix (see /auth/me) on the frontend to render
+    # "WRK-142". Not settable via TicketCreate/TicketUpdate — assigned once
+    # by create_ticket from Organization.next_ticket_number.
+    ticket_number: int
     # Nullable: a removed member's tickets are kept, not deleted, with
     # created_by set to NULL (migration 0008) — see app/api/org.py.
     created_by: uuid.UUID | None

@@ -78,6 +78,22 @@ async def main() -> None:
         assert {t["id"] for t in list_b.json()} == {ticket_b["id"]}
         print("PASS: GET tickets only lists each org's own ticket")
 
+        # --- ticket numbering: per-org sequence, not global -------------------
+        # Both orgs are brand new, so each org's *own* first ticket lands on
+        # 1 -- if the counter were accidentally shared/global instead of
+        # per-org, org B's ticket would have landed on 2, not 1.
+        assert ticket_a["ticket_number"] == 1, f"expected 1, got {ticket_a['ticket_number']}"
+        assert ticket_b["ticket_number"] == 1, f"expected 1, got {ticket_b['ticket_number']}"
+
+        second_a = await create_ticket(
+            client, token_a, project_a["id"], type="task", title="Org A Second Ticket"
+        )
+        second_a.raise_for_status()
+        assert second_a.json()["ticket_number"] == 2, (
+            f"expected 2, got {second_a.json()['ticket_number']}"
+        )
+        print("PASS: ticket numbers are sequential per org, not a shared global counter")
+
         # --- direct GET/PATCH/DELETE by id across orgs: 404, not filtered -----
         cross_get = await client.get(
             f"/projects/{project_a['id']}/tickets/{ticket_b['id']}", headers=auth_headers(token_a)
