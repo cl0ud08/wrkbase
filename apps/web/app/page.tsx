@@ -1,26 +1,9 @@
-"use client";
-
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
-
-import { useAuth } from "../lib/auth-context";
 import LandingPage from "../components/landing/LandingPage";
 
+// Always the public marketing page, logged in or not — LandingPage
+// itself reads auth state to swap CTAs ("Start free trial" -> "Go to
+// dashboard"), same pattern real SaaS marketing sites use rather than
+// redirecting an existing customer away from their own homepage.
 export default function Home() {
-  const { user, loading } = useAuth();
-  const router = useRouter();
-
-  useEffect(() => {
-    if (!loading && user) router.replace("/dashboard");
-  }, [loading, user, router]);
-
-  if (loading || user) {
-    return (
-      <div className="bg-grid flex flex-1 items-center justify-center bg-base">
-        <p className="text-sm text-ink-tertiary">Loading…</p>
-      </div>
-    );
-  }
-
   return <LandingPage />;
 }
