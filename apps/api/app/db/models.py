@@ -29,6 +29,16 @@ class SprintStatus(str, enum.Enum):
 
 
 class Organization(Base):
+    """The tenant root — every other RLS-protected table is scoped by an
+    org_id column pointing here, but this table has no such column of its
+    own; a row here IS a tenant. Its RLS policies (migration 0015) key off
+    id instead of org_id for that reason, and are split per-command rather
+    than a single USING+WITH CHECK pair: SELECT/UPDATE are scoped to your
+    own row, INSERT stays permissive since org.id doesn't exist until the
+    insert completes (self-serve signup has no tenant context yet at that
+    point) and INSERT can't leak existing rows the way SELECT/UPDATE can.
+    """
+
     __tablename__ = "organizations"
 
     id: Mapped[uuid.UUID] = mapped_column(

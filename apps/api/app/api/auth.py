@@ -195,10 +195,20 @@ async def signup(
     if is_invited:
         org_id, role = await _redeem_invite(db, payload.invite_token, payload.email)
     else:
-        org = Organization(name=payload.org_name, ticket_prefix=derive_ticket_prefix(payload.org_name))
-        db.add(org)
-        await db.flush()  # organizations has no RLS, so no tenant context needed yet
+        # id generated client-side, not left to the column's
+        # gen_random_uuid() server default: Postgres requires a row to
+        # pass a table's SELECT policy before an INSERT's implicit
+        # RETURNING (which the ORM always issues, to read back id and the
+        # other server-generated columns) can return it — even though the
+        # INSERT policy itself is permissive. Knowing the id up front lets
+        # tenant context be set to it *before* the flush, the same
+        # ordering the `users` insert just below already relies on.
+        org = Organization(
+            id=uuid.uuid4(), name=payload.org_name, ticket_prefix=derive_ticket_prefix(payload.org_name)
+        )
         await set_tenant_context(db, org.id)
+        db.add(org)
+        await db.flush()
         org_id, role = org.id, UserRole.ADMIN
 
     user = User(

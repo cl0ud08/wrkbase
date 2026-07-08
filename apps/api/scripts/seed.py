@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import uuid
 
 from app.core.security import hash_password
 from app.core.ticket_prefix import derive_ticket_prefix
@@ -21,15 +22,18 @@ ORGS = [
 async def main() -> None:
     for org_spec in ORGS:
         async with AsyncSessionLocal() as session:
+            # id generated client-side so tenant context can be set to it
+            # before the flush — see app/api/auth.py's signup() for why:
+            # organizations' SELECT policy (migration 0015) also gates the
+            # ORM's implicit INSERT ... RETURNING, so a context-less insert
+            # would satisfy the permissive INSERT policy but then fail to
+            # read the row back.
             org = Organization(
-                name=org_spec["name"], ticket_prefix=derive_ticket_prefix(org_spec["name"])
+                id=uuid.uuid4(), name=org_spec["name"], ticket_prefix=derive_ticket_prefix(org_spec["name"])
             )
-            session.add(org)
-            await session.flush()  # runs the INSERT so org.id is populated
-
-            # organizations has no RLS, but users does — the WITH CHECK
-            # policy requires tenant context to match the row being inserted.
             await set_tenant_context(session, org.id)
+            session.add(org)
+            await session.flush()
 
             user = User(
                 org_id=org.id,
