@@ -194,6 +194,17 @@ jobs:
       - name: Verify workflow-state tenant isolation
         run: python -m scripts.verify_workflow_rls
 
+      - name: Reset rate limiter (sprints)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Backlog + Sprints + story points: cross-org and cross-project
+      # sprint access, the single-active-sprint constraint under an actual
+      # concurrent race (not just a sequential check), paginated backlog,
+      # server-computed sprint totals, and complete_sprint's auto-return
+      # of unfinished tickets to the backlog.
+      - name: Verify sprints tenant isolation + single-active-sprint race
+        run: python -m scripts.verify_sprints_rls
+
       - name: Reset rate limiter (invites)
         run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
 
