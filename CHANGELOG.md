@@ -1284,3 +1284,127 @@ backend regression (the six existing scripts plus this one), `ruff`,
 and `pip-audit` all re-run clean afterward; frontend `ESLint`,
 `tsc --noEmit`, and a full `next build` all clean with every new route
 registered.
+
+---
+
+## Slice 18 — Phase 1d: Password reset
+
+**Built:** `password_reset_tokens` (migration 0013, no `org_id`, no
+RLS — this table has no authenticated management surface the way
+`Invite` does, so it never faces RLS's need for a tenant context
+before it can be queried; it's structurally closer to `UserLookup`/
+`InviteLookup` than to `Invite` itself). `POST /auth/password-reset/
+request` and `POST /auth/password-reset/confirm`, both public and
+unauthenticated by necessity — that's the whole point of a recovery
+path — with a 5/minute-per-IP rate limit on `request`, stricter than
+login/signup's 10/minute since this endpoint is a strictly easier
+abuse target (spamming it costs an attacker nothing but a valid-
+looking email address). Frontend: a "Forgot password?" link on
+login, a request form, and a token-from-URL confirm form.
+
+**Email enumeration — genuinely no observable difference, not just
+the same message.** The naive fix — return the same `message` string
+whether or not the account exists — still leaks the answer through a
+second channel this app specifically has to solve around: `reset_link`
+is only how this endpoint hands back a token at all, since real email
+delivery is out of scope (same limitation as invites). Populating that
+field only when the account is real, and omitting or nulling it
+otherwise, would make the field's *presence* the oracle instead of the
+message text — a smaller leak, but still a leak, and still enough to
+enumerate every registered email in the system one HTTP call at a time.
+
+The actual fix: `request_password_reset` generates a token on *every*
+call, unconditionally, before it even knows whether the account
+exists. That token is only ever persisted to `password_reset_tokens` —
+and therefore only ever valid — when the email resolves to a real user
+via `UserLookup`. The response always contains a well-formed
+`reset_link`, real account or not. An unpersisted token, handed to
+`confirm_password_reset`, fails with exactly the same 400 ("Invalid,
+expired, or already-used reset link") a genuinely expired or
+already-used real token gets — there is no code path, status code, or
+response shape that distinguishes "this email was never registered"
+from "this link already expired." Proven directly in
+`verify_password_reset.py`, not just asserted: a request for a real
+email and a request for a fabricated one are compared key-for-key and
+found identical, and the fabricated one's token is then handed to
+`confirm` and shown to actually fail, not just cosmetically resemble a
+working link.
+
+**Named, not hidden: the one thing this doesn't equalize.** The
+found-branch does one extra write (`INSERT INTO password_reset_tokens`)
+that the not-found branch skips entirely — a real, if small, timing
+difference between the two cases. This is a deliberate scope
+boundary, not an oversight: response-content parity closes the loop
+an attacker can actually exploit cheaply (read the JSON, compare
+fields); constant-time equalization against network-level timing
+analysis is a substantially deeper problem — the DB write's few
+milliseconds are usually swamped by ordinary network jitter over a
+real connection — and solving it isn't free (a dummy write, or an
+artificial delay, adds real latency to the common case for a
+marginal, hard-to-actually-exploit benefit). Flagged here as an
+explicit, acknowledged residual gap, the same honesty this project
+has applied to every other named-but-deferred limitation (the
+workflow-order "done" heuristic, project archiving, etc.), not
+something quietly left unsaid.
+
+**Why `confirm_password_reset` revokes every outstanding refresh
+token, walked through as an actual attack, not asserted as obviously
+correct.** Say an attacker has a stolen refresh token — a synced
+browser profile on a device that went missing, a session cookie
+leaked some other way. They never needed the password at all: refresh
+rotation (see `refresh()` in `app/api/auth.py`) only requires *them*
+to keep refreshing before the legitimate user does, which they can do
+indefinitely, no password ever re-checked at any point in that cycle.
+Now the legitimate user notices something's off and resets their
+password through this flow. If `confirm_password_reset` only updated
+`hashed_password` and stopped there, that reset would have changed
+*nothing the attacker actually needed* — their already-issued refresh
+token is a completely separate credential from the password, sitting
+in Redis with no relationship to `users.hashed_password` at all,
+still valid, still rotating on schedule. The user would walk away
+believing they'd secured the account while the attacker's session
+kept working, unaffected, through the very mechanism (password reset)
+they used specifically because they suspected compromise. That's the
+actual failure mode `revoke_all_refresh_tokens_for_user(user.id)`
+closes — every session dies, including the attacker's, forcing
+anyone who wants back in to actually know the new password. This is
+not a new mechanism: it's the identical fix `remove_member` already
+applied in `app/api/org.py` for the same underlying gap ("removed but
+still has a working session indefinitely"), just triggered by a
+different trust-changing event. Called after the commit, not before —
+same ordering, same reasoning as `remove_member`: if the password
+update had failed to commit, revoking every session first would lock
+out someone whose password never actually changed.
+
+**One deliberate exception to the real-HTTP-only proof-script
+convention, named as such.** Every proof script this project has
+written so far — `verify_rls.py` through `verify_sprints_rls.py` —
+proves its case entirely over real HTTP, on principle: it's what
+actually runs in production, so it's what should be exercised.
+Proving a *token expires* breaks that principle structurally, not
+because of laziness: `password_reset_expire_minutes` defaults to 45,
+and no HTTP call can fast-forward a wall clock. The alternatives were
+running CI 45 minutes slower for one assertion, making the expiry
+window configurable per-environment (real behavior diverging between
+dev/test and production, exactly the kind of split this project has
+avoided elsewhere), or reaching directly into Postgres to backdate one
+token's `expires_at` into the past. `verify_password_reset.py` does
+the last of these — `password_reset_tokens` has no RLS (see above),
+so this doesn't even need a tenant context, just a direct `UPDATE` via
+the same `AsyncSessionLocal` `scripts/seed.py` already uses — and the
+module docstring says so explicitly, so this doesn't read as an
+unexplained inconsistency with every other script's discipline.
+
+**Verified.** `verify_password_reset.py` (new; wired into CI
+immediately after the auth+RLS integration proof, before projects):
+the enumeration-identical-response check described above, reuse
+rejected (a token that already succeeded can't succeed again),
+requesting a reset twice and confirming with the newer token
+invalidates the older one, the backdated-expiry check, and — the
+check with real security weight — a refresh token issued *before* the
+reset is proven dead *after* it via the same "actually call
+`/auth/refresh` and check it fails" structural test `verify_invites_rls.py`
+already established for member removal, not an assumption that the
+revocation call worked. Full eight-script backend regression, `ruff`,
+and `pip-audit` all clean; frontend `ESLint`, `tsc --noEmit`, and a
+full `next build` clean with both new routes registered.

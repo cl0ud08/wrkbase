@@ -7,7 +7,12 @@ import type { NextRequest } from "next/server";
 // request — and expired-access-token recovery happens client-side via
 // apiFetch's silent refresh (lib/api.ts). Doing that here would mean an
 // extra network round trip for every single navigation.
-const ALWAYS_PUBLIC_PATHS = ["/"];
+// forgot-password/reset-password are public rather than logged-out-only:
+// unlike /login and /signup, there's a real (if unusual) case for reaching
+// them while a session is active elsewhere — e.g. clicking an old reset
+// email on a second device that's still logged in — and redirecting that
+// away would just break the confirm-token flow for no real security gain.
+const ALWAYS_PUBLIC_PATHS = ["/", "/forgot-password", "/reset-password"];
 const LOGGED_OUT_ONLY_PATHS = ["/login", "/signup"];
 
 // Next.js 16 renamed the `middleware.ts` file convention to `proxy.ts`

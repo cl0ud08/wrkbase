@@ -58,7 +58,12 @@ export default function LoginPage() {
           />
         </label>
         <label className="flex flex-col gap-1.5 text-sm text-ink-secondary">
-          Password
+          <span className="flex items-center justify-between">
+            Password
+            <a href="/forgot-password" className="text-xs font-medium text-ink-tertiary hover:text-accent">
+              Forgot password?
+            </a>
+          </span>
           <input
             type="password"
             className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
