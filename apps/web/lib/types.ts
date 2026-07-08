@@ -51,6 +51,9 @@ export interface Ticket {
   // Nullable: unassigned, or a removed member's old assignment (SET NULL
   // on member removal, same as createdBy) — see migration 0009.
   assigneeId: string | null;
+  // Combine with the current org's ticketPrefix (see lib/auth-context.tsx)
+  // to render a ticket's display key, e.g. "WRK-142".
+  ticketNumber: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -71,6 +74,7 @@ interface TicketApiResponse {
   position: number;
   created_by: string | null;
   assignee_id: string | null;
+  ticket_number: number;
   created_at: string;
   updated_at: string;
 }
@@ -88,6 +92,7 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     position: data.position,
     createdBy: data.created_by,
     assigneeId: data.assignee_id,
+    ticketNumber: data.ticket_number,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
   };

@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 
-import { apiFetch } from "../../../../lib/api";
-import { mapWorkflowState, type WorkflowState } from "../../../../lib/types";
+import { apiFetch } from "../../../../../lib/api";
+import { mapWorkflowState, type WorkflowState } from "../../../../../lib/types";
 
 export default function WorkflowSettingsPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -76,64 +76,62 @@ export default function WorkflowSettingsPage() {
   }
 
   return (
-    <div className="flex flex-1 flex-col items-center gap-6 bg-zinc-50 px-6 py-16 font-sans dark:bg-black">
-      <div className="w-full max-w-md">
-        <a
-          href={`/projects/${projectId}`}
-          className="text-sm text-zinc-500 hover:underline dark:text-zinc-500"
-        >
-          &larr; Board
-        </a>
-        <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">
-          Workflow settings
-        </h1>
-      </div>
+    <div className="flex flex-1 flex-col items-center px-4 py-10">
+      <div className="flex w-full max-w-md flex-col gap-5">
+        <div>
+          <a href={`/projects/${projectId}`} className="text-xs text-ink-tertiary hover:text-ink-secondary">
+            ← Board
+          </a>
+          <h1 className="text-lg font-bold tracking-tight text-ink">Workflow settings</h1>
+        </div>
 
-      {error && <p className="text-sm text-red-500">{error}</p>}
-
-      <div className="flex w-full max-w-md flex-col gap-2">
-        {states === null && (
-          <p className="text-sm text-zinc-600 dark:text-zinc-400">Loading...</p>
+        {error && (
+          <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
         )}
-        {states?.map((state, index) => (
-          <div
-            key={state.id}
-            className="flex items-center gap-3 rounded-xl border border-black/[.08] p-3 dark:border-white/[.145]"
-          >
-            <div className="flex flex-col text-xs">
-              <button
-                onClick={() => swap(index, -1)}
-                disabled={index === 0}
-                className="disabled:opacity-30"
-                aria-label="Move up"
-              >
-                &uarr;
-              </button>
-              <button
-                onClick={() => swap(index, 1)}
-                disabled={index === states.length - 1}
-                className="disabled:opacity-30"
-                aria-label="Move down"
-              >
-                &darr;
-              </button>
-            </div>
-            <input
-              className="flex-1 rounded-md border border-black/[.08] px-2 py-1 text-sm dark:border-white/[.145] dark:bg-zinc-900"
-              defaultValue={state.name}
-              onBlur={(e) => rename(state, e.target.value)}
-            />
-            <label className="flex items-center gap-1 text-xs text-zinc-500 dark:text-zinc-500">
+
+        <div className="flex flex-col gap-2">
+          {states === null && <p className="text-sm text-ink-tertiary">Loading…</p>}
+          {states?.map((state, index) => (
+            <div
+              key={state.id}
+              className="flex items-center gap-3 rounded-lg border border-line bg-surface p-3"
+            >
+              <div className="flex flex-col font-mono text-xs text-ink-tertiary">
+                <button
+                  onClick={() => swap(index, -1)}
+                  disabled={index === 0}
+                  className="hover:text-accent disabled:opacity-30 disabled:hover:text-ink-tertiary"
+                  aria-label="Move up"
+                >
+                  ↑
+                </button>
+                <button
+                  onClick={() => swap(index, 1)}
+                  disabled={index === states.length - 1}
+                  className="hover:text-accent disabled:opacity-30 disabled:hover:text-ink-tertiary"
+                  aria-label="Move down"
+                >
+                  ↓
+                </button>
+              </div>
               <input
-                type="radio"
-                name="default-state"
-                checked={state.isDefault}
-                onChange={() => setDefault(state)}
+                className="flex-1 rounded-md border border-line bg-surface-2 px-2.5 py-1.5 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
+                defaultValue={state.name}
+                onBlur={(e) => rename(state, e.target.value)}
               />
-              default
-            </label>
-          </div>
-        ))}
+              <label className="flex items-center gap-1.5 text-xs text-ink-secondary">
+                <input
+                  type="radio"
+                  name="default-state"
+                  checked={state.isDefault}
+                  onChange={() => setDefault(state)}
+                  className="accent-[var(--accent)]"
+                />
+                default
+              </label>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

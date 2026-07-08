@@ -10,6 +10,9 @@ interface AuthUser {
   email: string;
   orgId: string;
   orgName: string;
+  // Displayed as the PREFIX half of a ticket's key (PREFIX-NUMBER, e.g.
+  // WRK-142) — see app/(shell)/projects/[projectId]/page.tsx.
+  ticketPrefix: string;
   role: string;
 }
 
@@ -35,6 +38,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         email: data.email,
         orgId: data.org_id,
         orgName: data.org_name,
+        ticketPrefix: data.ticket_prefix,
         role: data.role,
       });
     } else {

@@ -14,21 +14,41 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-import { apiFetch } from "../../../lib/api";
+import { apiFetch } from "../../../../lib/api";
+import { useAuth } from "../../../../lib/auth-context";
 import {
   mapMember,
   mapTicket,
   mapWorkflowState,
   type Member,
   type Ticket,
+  type TicketType,
   type WorkflowState,
-} from "../../../lib/types";
+} from "../../../../lib/types";
 
 // First two chars of the email's local part — no display-name field exists
 // on User yet, so email is the only identity data available to derive a
 // compact badge from.
 function initials(email: string): string {
   return email.slice(0, 2).toUpperCase();
+}
+
+const TYPE_STYLE: Record<TicketType, { label: string; text: string; bg: string }> = {
+  epic: { label: "Epic", text: "text-type-epic", bg: "bg-type-epic-bg" },
+  story: { label: "Story", text: "text-type-story", bg: "bg-type-story-bg" },
+  task: { label: "Task", text: "text-type-task", bg: "bg-type-task-bg" },
+  subtask: { label: "Subtask", text: "text-type-subtask", bg: "bg-type-subtask-bg" },
+};
+
+function TypeBadge({ type }: { type: TicketType }) {
+  const style = TYPE_STYLE[type];
+  return (
+    <span
+      className={`rounded-sm px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide uppercase ${style.text} ${style.bg}`}
+    >
+      {style.label}
+    </span>
+  );
 }
 
 function columnTickets(tickets: Ticket[], stateId: string): Ticket[] {
@@ -49,10 +69,12 @@ function computePosition(siblings: Ticket[], index: number): number {
 
 function Card({
   ticket,
+  ticketKey,
   members,
   onAssigneeChange,
 }: {
   ticket: Ticket;
+  ticketKey: string;
   members: Member[];
   onAssigneeChange: (ticketId: string, assigneeId: string | null) => void;
 }) {
@@ -62,7 +84,6 @@ function Card({
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
-    opacity: isDragging ? 0.4 : 1,
   };
   const assignee = members.find((m) => m.id === ticket.assigneeId);
 
@@ -72,37 +93,48 @@ function Card({
       style={style}
       {...attributes}
       {...listeners}
-      className="cursor-grab rounded-lg border border-black/[.08] bg-white p-3 text-sm shadow-sm active:cursor-grabbing dark:border-white/[.145] dark:bg-zinc-900"
+      className={`group cursor-grab rounded-md border bg-surface-2 p-2.5 text-sm shadow-[var(--shadow-card)] transition-[transform,box-shadow,border-color,opacity] duration-150 ease-out active:cursor-grabbing ${
+        isDragging
+          ? "border-accent opacity-50 shadow-[0_0_0_3px_var(--accent-subtle)]"
+          : "border-line-subtle hover:-translate-y-0.5 hover:border-line-strong hover:shadow-[var(--shadow-card-hover)]"
+      }`}
     >
-      <div className="flex items-start justify-between gap-2">
-        <span className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
-          {ticket.type}
-        </span>
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <span className="font-mono text-[11px] text-ink-tertiary">{ticketKey}</span>
+        <TypeBadge type={ticket.type} />
+      </div>
+      <p className="mb-2 leading-snug text-ink">{ticket.title}</p>
+      <div className="flex items-center justify-between gap-2">
         <span
           title={assignee ? assignee.email : "Unassigned"}
-          className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-black/[.08] text-[10px] font-medium text-zinc-700 dark:bg-white/[.12] dark:text-zinc-300"
+          className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-[4px] font-mono text-[9px] font-semibold ${
+            assignee
+              ? "border border-line bg-hover text-ink-secondary"
+              : "border border-dashed border-line text-ink-tertiary"
+          }`}
         >
           {assignee ? initials(assignee.email) : "?"}
         </span>
+        <select
+          value={ticket.assigneeId ?? ""}
+          onChange={(e) => onAssigneeChange(ticket.id, e.target.value || null)}
+          // dnd-kit's drag listeners are spread on this card's outer div
+          // ({...listeners} above) and fire on pointerdown; without
+          // stopping propagation here, opening this native <select> would
+          // also be read as the start of a drag gesture on the card
+          // underneath it. Any future interactive control added directly
+          // onto a card needs the same guard.
+          onPointerDown={(e) => e.stopPropagation()}
+          className="min-w-0 flex-1 cursor-pointer truncate rounded-sm border-0 bg-transparent py-0.5 text-right text-xs text-ink-tertiary hover:text-ink-secondary"
+        >
+          <option value="">Unassigned</option>
+          {members.map((member) => (
+            <option key={member.id} value={member.id}>
+              {member.email}
+            </option>
+          ))}
+        </select>
       </div>
-      <p className="font-medium text-black dark:text-zinc-50">{ticket.title}</p>
-      <select
-        value={ticket.assigneeId ?? ""}
-        onChange={(e) => onAssigneeChange(ticket.id, e.target.value || null)}
-        // dnd-kit's drag listeners are spread on this card's outer div
-        // ({...listeners} above) and fire on pointerdown; without stopping
-        // propagation here, opening this native <select> would also be
-        // read as the start of a drag gesture on the card underneath it.
-        onPointerDown={(e) => e.stopPropagation()}
-        className="mt-2 w-full cursor-pointer rounded-md border border-black/[.08] bg-transparent px-2 py-1 text-xs text-zinc-700 dark:border-white/[.145] dark:text-zinc-300"
-      >
-        <option value="">Unassigned</option>
-        {members.map((member) => (
-          <option key={member.id} value={member.id}>
-            {member.email}
-          </option>
-        ))}
-      </select>
     </div>
   );
 }
@@ -110,11 +142,13 @@ function Card({
 function Column({
   state,
   tickets,
+  ticketPrefix,
   members,
   onAssigneeChange,
 }: {
   state: WorkflowState;
   tickets: Ticket[];
+  ticketPrefix: string;
   members: Member[];
   onAssigneeChange: (ticketId: string, assigneeId: string | null) => void;
 }) {
@@ -129,21 +163,36 @@ function Column({
   return (
     <div
       ref={setNodeRef}
-      className={`flex w-72 flex-shrink-0 flex-col gap-2 rounded-xl border p-3 transition-colors ${
-        isOver ? "bg-black/[.03] dark:bg-white/[.05]" : ""
-      } border-black/[.08] dark:border-white/[.145]`}
+      className={`flex w-[268px] flex-shrink-0 flex-col gap-2 rounded-lg border p-2 transition-colors duration-150 ${
+        isOver
+          ? "border-accent border-dashed bg-accent-subtle"
+          : "border-line-subtle bg-surface"
+      }`}
     >
-      <h3 className="px-1 text-sm font-semibold text-zinc-700 dark:text-zinc-300">{state.name}</h3>
+      <div className="flex items-center justify-between px-1 pt-0.5">
+        <h3 className="text-[11px] font-bold tracking-wide text-ink-secondary uppercase">
+          {state.name}
+        </h3>
+        <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-tertiary">
+          {tickets.length}
+        </span>
+      </div>
       <SortableContext items={tickets.map((t) => t.id)} strategy={verticalListSortingStrategy}>
-        <div className="flex min-h-[40px] flex-col gap-2">
+        <div className="flex min-h-[48px] flex-col gap-1.5">
           {tickets.map((ticket) => (
             <Card
               key={ticket.id}
               ticket={ticket}
+              ticketKey={`${ticketPrefix}-${ticket.ticketNumber}`}
               members={members}
               onAssigneeChange={onAssigneeChange}
             />
           ))}
+          {tickets.length === 0 && (
+            <div className="flex min-h-[48px] items-center justify-center rounded-md border border-dashed border-line-subtle">
+              <span className="text-xs text-ink-tertiary">Drop here</span>
+            </div>
+          )}
         </div>
       </SortableContext>
     </div>
@@ -152,6 +201,7 @@ function Column({
 
 export default function ProjectBoardPage() {
   const { projectId } = useParams<{ projectId: string }>();
+  const { user } = useAuth();
 
   const [states, setStates] = useState<WorkflowState[] | null>(null);
   const [tickets, setTickets] = useState<Ticket[] | null>(null);
@@ -281,27 +331,27 @@ export default function ProjectBoardPage() {
     }
   }
 
+  const isEmpty = tickets !== null && tickets.length === 0;
+
   return (
-    <div className="flex flex-1 flex-col gap-6 bg-zinc-50 px-6 py-10 font-sans dark:bg-black">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-1 flex-col gap-4 px-4 py-5">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <a href="/dashboard" className="text-sm text-zinc-500 hover:underline dark:text-zinc-500">
-            &larr; Projects
+          <a href="/dashboard" className="text-xs text-ink-tertiary hover:text-ink-secondary">
+            ← Projects
           </a>
-          <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">
-            Board
-          </h1>
+          <h1 className="text-lg font-bold tracking-tight text-ink">Board</h1>
         </div>
-        <div className="flex gap-3">
+        <div className="flex gap-2">
           <a
             href={`/projects/${projectId}/settings`}
-            className="rounded-full border border-black/[.08] px-5 py-2 text-sm font-medium transition-colors hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+            className="rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover"
           >
             Workflow settings
           </a>
           <button
             onClick={() => setShowForm((v) => !v)}
-            className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+            className="rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
           >
             {showForm ? "Cancel" : "New ticket"}
           </button>
@@ -311,36 +361,60 @@ export default function ProjectBoardPage() {
       {showForm && (
         <form
           onSubmit={handleCreate}
-          className="flex w-full max-w-md flex-col gap-3 rounded-xl border border-black/[.08] p-4 dark:border-white/[.145]"
+          className="flex w-full max-w-md flex-col gap-2.5 rounded-lg border border-line bg-surface p-3"
         >
           <input
-            className="rounded-md border border-black/[.08] px-3 py-2 text-sm dark:border-white/[.145] dark:bg-zinc-900"
+            className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
             placeholder="Ticket title"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             required
           />
-          {error && <p className="text-sm text-red-500">{error}</p>}
+          {error && (
+            <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
+          )}
           <button
             type="submit"
             disabled={submitting}
-            className="self-start rounded-full bg-foreground px-4 py-1.5 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
+            className="self-start rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
           >
-            {submitting ? "Creating..." : "Create"}
+            {submitting ? "Creating…" : "Create"}
           </button>
         </form>
       )}
 
+      {error && !showForm && (
+        <p className="w-fit rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
+      )}
+
       {states === null || tickets === null ? (
-        <p className="text-sm text-zinc-600 dark:text-zinc-400">Loading...</p>
+        <p className="text-sm text-ink-tertiary">Loading…</p>
+      ) : isEmpty ? (
+        <div className="flex flex-col items-start gap-2.5 rounded-lg border border-dashed border-line px-5 py-9">
+          <div className="flex h-8 w-8 items-center justify-center rounded-md border border-line bg-surface-2 font-mono text-sm text-accent">
+            +
+          </div>
+          <h2 className="text-sm font-semibold text-ink">No tickets yet</h2>
+          <p className="max-w-xs text-sm text-ink-secondary">
+            Create one to get started — it&apos;ll land in{" "}
+            {states.find((s) => s.isDefault)?.name ?? "the first column"}.
+          </p>
+          <button
+            onClick={() => setShowForm(true)}
+            className="mt-1 rounded-md bg-accent px-3.5 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
+          >
+            New ticket
+          </button>
+        </div>
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
-          <div className="flex gap-4 overflow-x-auto pb-4">
+          <div className="flex gap-3 overflow-x-auto pb-3">
             {states.map((state) => (
               <Column
                 key={state.id}
                 state={state}
                 tickets={columnTickets(tickets, state.id)}
+                ticketPrefix={user?.ticketPrefix ?? "TKT"}
                 members={members}
                 onAssigneeChange={handleAssigneeChange}
               />

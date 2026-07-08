@@ -1005,3 +1005,145 @@ all — restoring the project alone brings them straight back, which is
 the archiving-shaped behavior this slice deliberately isn't building a
 separate feature for yet. Full six-script regression, `ruff`, and
 `pip-audit` all re-run clean afterward.
+
+---
+
+## Slice 16 — UI/UX redesign: a real design system, a global theme
+toggle, and per-org ticket numbering
+
+**Built:** Every screen (homepage, login, signup, dashboard, Kanban
+board, workflow settings, team) restyled against one shared token
+system instead of default Tailwind, plus a persistent app shell, a
+real marketing landing page, and a project-wide dark/light theme
+toggle. This slice is mostly styling, but three things in it are new
+mechanisms, not new colors — the route restructuring, the ticket-key
+schema addition, and the theme system — and those are what's actually
+worth documenting; the per-page visual changes speak for themselves.
+
+**The token system, exact values.** CSS custom properties on `:root`
+(light, the fallback), re-declared under `:root[data-theme="dark"]`
+and `:root[data-theme="light"]` (see the theme-toggle section below
+for why those exist alongside a plain media query), mapped into
+Tailwind's utility namespace once via `@theme inline` so components
+use plain classes (`bg-surface`, `text-ink-secondary`) that are
+already theme-reactive — no `dark:` variants anywhere in the
+component tree.
+
+- Backgrounds: `--bg-base` `#f2f3f5` / `#14171c`, `--bg-surface`
+  `#ffffff` / `#191d24`, `--bg-surface-2` `#f8f9fb` / `#1f2530`,
+  `--bg-hover` `#ececf1` / `#242a35`.
+- Borders: `--line-subtle` `#e4e6ea` / `#262b34`, `--line` `#d4d7dd` /
+  `#323944`, `--line-strong` `#b7bcc5` / `#454e5c`.
+- Text: `--ink` `#1b1f26` / `#e7eaef`, `--ink-secondary` `#5c6472` /
+  `#99a2b0`, `--ink-tertiary` `#848d9b` / `#616b79`.
+- One accent (desaturated amber, not a saturated brand blue): `--accent`
+  `#b8823c` / `#d9a25b`, plus `-hover`/`-active`/`-on`/`-subtle`/
+  `-subtle-text` variants for buttons and highlighted states.
+- Muted semantic colors, deliberately a *different* hue family from
+  the accent so an AI-touchpoint highlight (accent) is never confused
+  with a status color: `--success`, `--info`, `--warning`, `--danger`,
+  `--neutral`, each with a paired `-bg` for chip backgrounds.
+- Four muted ticket-type colors (`--type-epic/story/task/subtask` +
+  `-bg`), used only by the board's `TypeBadge`.
+- Radii: `--radius-sm` 4px, `--radius-md` 6px, `--radius-lg` 10px —
+  Linear-density rounding, not the full-pill buttons default
+  shadcn/Tailwind demos tend toward.
+- Type: IBM Plex Sans for UI copy, IBM Plex Mono for anything that's a
+  *value* — ticket ids, timestamps, status codes — both self-hosted via
+  `next/font/google`, picked deliberately over Inter/Space Grotesk
+  (flagged in the design pass as the current "safe default" look most
+  AI-assisted design output converges on).
+
+**Route restructuring: a persistent shell where there was none.**
+`dashboard/`, `projects/[projectId]/`, and `team/` moved under a new
+`app/(shell)/` route group with its own `layout.tsx` — a route group
+changes nothing about the URLs, only which layout wraps which pages.
+Before this slice there was no persistent chrome at all: every page
+was its own island, no nav, no way to tell which org's data you were
+looking at short of reading it off the page content. The shell adds a
+sticky top bar with a nav, and — the one deliberately "always visible"
+element — an org-identity chip (initials + org name) that's meant to
+double as a quiet reminder of the tenant-isolation pitch: you're
+always looking at *one* org's board, and the UI never lets that fact
+scroll out of view.
+
+**Ticket numbering (`organizations.ticket_prefix`/`next_ticket_number`,
+`tickets.ticket_number` — migration 0011): a real schema addition, not
+a styling decision, that this slice needed and built.** The board
+redesign wanted to show a ticket's key next to its title
+(`WRK-142`-style), and the honest options were: derive something
+fake from the UUID (a truncated id that looks like a key but means
+nothing and isn't stable under re-sorting), or add a real per-org
+sequence. Asked directly, chose the real one. `ticket_prefix` is
+*stored* on the organization at signup, not derived live from
+`org.name` on every read — there's no org-rename endpoint today so
+the two are equivalent right now, but a ticket's displayed key is
+meant to be permanent once assigned, and deriving it live would
+silently change every existing ticket's key the moment renaming ships.
+`next_ticket_number` is incremented with a single atomic statement —
+`UPDATE organizations SET next_ticket_number = next_ticket_number + 1
+... RETURNING next_ticket_number - 1` — relying on Postgres's normal
+row-level locking to serialize concurrent ticket creation in the same
+org; no separate application-level lock needed, and no read-then-write
+race the way `SELECT next_ticket_number` followed by a separate
+`UPDATE` would have. Proof-script coverage added specifically to catch
+the failure mode a *shared* counter would produce: two brand-new orgs'
+first tickets both landing on `1`, not `1` and `2`.
+
+**A real theme system, not just a media query.** The app already had
+`@media (prefers-color-scheme: dark)` before this slice, but that's
+read-only — a visitor's OS setting, with no way to override it short
+of changing their OS. This slice adds `ThemeProvider`
+(`lib/theme-context.tsx`), a small hand-rolled context (not a
+dependency — the whole job is "read one `localStorage` key, default to
+dark, write it back on toggle," not enough surface to justify pulling
+in a library for) that stamps `data-theme="dark"` or `data-theme="light"`
+onto `<html>`. `globals.css` gained explicit `:root[data-theme="dark"]`
+/ `:root[data-theme="light"]` blocks alongside the existing media
+query — an attribute selector on `:root` is more specific than a bare
+`:root` inside `@media`, so the manual override always wins regardless
+of OS preference, in both directions. An inline script in
+`app/layout.tsx`'s `<head>` — plain JS, no library — reads the stored
+preference (or defaults to `dark`) and sets the attribute *before*
+hydration, so there's no light-then-dark flash on load the way a
+purely React-driven toggle would produce. Dark is now the deliberate
+product default everywhere (previously only true if the visitor's OS
+happened to be set to dark) — light is one click away via the toggle
+now living in both the app shell's top bar and the landing page hero.
+
+**The blueprint-grid texture, applied project-wide, deliberately
+faint.** A tiled 44px grid-line pattern (`--grid-line`, ~5–6% opacity)
+layered alongside each screen's base background color via a `bg-grid`
+utility class. Applied everywhere — the shell, login, signup, the
+landing page — not just the marketing hero, because the ask was one
+consistent visual identity across the whole product, not a
+marketing-only flourish. Kept intentionally faint specifically because
+it has to sit behind dense card grids on the Kanban board without
+competing with the tickets on top of it — this is the same restraint
+argument as the rest of the design direction (Jira's heaviness is the
+thing being avoided, not replaced with a different kind of visual
+noise).
+
+**The landing page didn't exist before.** The root route was
+previously a bare "sign up / log in" placeholder. It's now a full
+marketing page — hero with a live-style board mockup built from the
+same real components and tokens as the actual board (not a
+screenshot), a feature grid grounded in what's actually shipped (RLS,
+soft-delete, real ticket ids, CI scanning — no invented features),
+and a security section documenting the actual enforcement mechanisms
+by name. Logged-in visitors hitting `/` are redirected straight to
+`/dashboard`, same pattern as Linear/Notion — the landing page is
+strictly for logged-out visitors.
+
+**Verified.** ESLint, `tsc --noEmit`, and a full `next build` all
+clean. Two real bugs caught along the way, not glossed over: an
+import-path depth miscount on the workflow-settings page after the
+route move (`../../../../lib/api` needed to become
+`../../../../../lib/api` — caught by `tsc`, not by inspection), and a
+bad `Edit` that duplicated a JSX block while escaping quotes on the
+landing page (caught by re-reading the file before it ever reached
+lint). Because the board's `Card`/`Column` components were
+restructured, not just recolored — `Card` gained a `ticketKey` prop
+and a `TypeBadge`, hover/drag states were rewritten against new
+tokens — this slice's regression pass re-confirms drag-and-drop itself
+still works end to end, not just that the new styles compile.

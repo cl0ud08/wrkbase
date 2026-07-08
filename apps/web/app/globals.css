@@ -1,26 +1,308 @@
 @import "tailwindcss";
 
+/* Design tokens. Light values live on :root as the fallback; the
+   prefers-color-scheme media query covers JS-disabled visitors; and
+   [data-theme] on <html> (set by ThemeProvider, see lib/theme-context.tsx)
+   is the real source of truth once the app has hydrated — it's more
+   specific than a bare :root selector, so it always wins over the media
+   query. Every component reads these through @theme inline below, so a
+   component never needs `dark:` variants for color — the token itself
+   already changes value under whichever layer is active. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+  --bg-base: #f2f3f5;
+  --bg-surface: #ffffff;
+  --bg-surface-2: #f8f9fb;
+  --bg-hover: #ececf1;
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --line-subtle: #e4e6ea;
+  --line: #d4d7dd;
+  --line-strong: #b7bcc5;
+
+  --ink: #1b1f26;
+  --ink-secondary: #5c6472;
+  --ink-tertiary: #848d9b;
+
+  --accent: #b8823c;
+  --accent-hover: #a5762f;
+  --accent-active: #8f6527;
+  --accent-on: #ffffff;
+  --accent-subtle: #f3e6d2;
+  --accent-subtle-text: #8f6527;
+
+  --success: #4f7d58;
+  --success-bg: #e6efe7;
+  --info: #4f6a8f;
+  --info-bg: #e6ebf2;
+  --warning: #8a6f3f;
+  --warning-bg: #f1e9d8;
+  --danger: #a34c4c;
+  --danger-bg: #f3e3e3;
+  --neutral: #5c6472;
+  --neutral-bg: #e9eaed;
+
+  --type-epic: #6c5a9e;
+  --type-epic-bg: #ece8f5;
+  --type-story: #3f7d6c;
+  --type-story-bg: #e3f0eb;
+  --type-task: #4f6a8f;
+  --type-task-bg: #e6ecf3;
+  --type-subtask: #5c6472;
+  --type-subtask-bg: #e9eaed;
+
+  --shadow-card: 0 1px 2px rgba(20, 23, 28, 0.08);
+  --shadow-card-hover: 0 8px 20px rgba(20, 23, 28, 0.12);
+  --shadow-elevated: 0 12px 32px rgba(20, 23, 28, 0.14), 0 2px 8px rgba(20, 23, 28, 0.08);
+
+  /* Decorative only (marketing hero grid texture) — kept separate from
+     --line so re-tinting the texture never touches real border colors. */
+  --grid-line: rgba(20, 23, 28, 0.06);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --bg-base: #14171c;
+    --bg-surface: #191d24;
+    --bg-surface-2: #1f2530;
+    --bg-hover: #242a35;
+
+    --line-subtle: #262b34;
+    --line: #323944;
+    --line-strong: #454e5c;
+
+    --ink: #e7eaef;
+    --ink-secondary: #99a2b0;
+    --ink-tertiary: #616b79;
+
+    --accent: #d9a25b;
+    --accent-hover: #e6b274;
+    --accent-active: #c08d49;
+    --accent-on: #14171c;
+    --accent-subtle: #2e2419;
+    --accent-subtle-text: #e0b172;
+
+    --success: #7fa687;
+    --success-bg: #1c2620;
+    --info: #7b93b5;
+    --info-bg: #1b222c;
+    --warning: #bfa06b;
+    --warning-bg: #26211a;
+    --danger: #c07272;
+    --danger-bg: #291b1b;
+    --neutral: #7a8290;
+    --neutral-bg: #1e222a;
+
+    --type-epic: #9a8cc2;
+    --type-epic-bg: #262138;
+    --type-story: #6faf9e;
+    --type-story-bg: #16241f;
+    --type-task: #7b93b5;
+    --type-task-bg: #182430;
+    --type-subtask: #8a8f99;
+    --type-subtask-bg: #22262e;
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-card-hover: 0 8px 20px rgba(0, 0, 0, 0.35);
+    --shadow-elevated: 0 12px 32px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
+
+    --grid-line: rgba(255, 255, 255, 0.055);
   }
 }
 
+/* Explicit overrides — same values as the blocks above, just reachable
+   by attribute selector instead of media query so ThemeProvider's manual
+   toggle can force either theme regardless of OS preference. */
+:root[data-theme="dark"] {
+  --bg-base: #14171c;
+  --bg-surface: #191d24;
+  --bg-surface-2: #1f2530;
+  --bg-hover: #242a35;
+
+  --line-subtle: #262b34;
+  --line: #323944;
+  --line-strong: #454e5c;
+
+  --ink: #e7eaef;
+  --ink-secondary: #99a2b0;
+  --ink-tertiary: #616b79;
+
+  --accent: #d9a25b;
+  --accent-hover: #e6b274;
+  --accent-active: #c08d49;
+  --accent-on: #14171c;
+  --accent-subtle: #2e2419;
+  --accent-subtle-text: #e0b172;
+
+  --success: #7fa687;
+  --success-bg: #1c2620;
+  --info: #7b93b5;
+  --info-bg: #1b222c;
+  --warning: #bfa06b;
+  --warning-bg: #26211a;
+  --danger: #c07272;
+  --danger-bg: #291b1b;
+  --neutral: #7a8290;
+  --neutral-bg: #1e222a;
+
+  --type-epic: #9a8cc2;
+  --type-epic-bg: #262138;
+  --type-story: #6faf9e;
+  --type-story-bg: #16241f;
+  --type-task: #7b93b5;
+  --type-task-bg: #182430;
+  --type-subtask: #8a8f99;
+  --type-subtask-bg: #22262e;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-card-hover: 0 8px 20px rgba(0, 0, 0, 0.35);
+  --shadow-elevated: 0 12px 32px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
+
+  --grid-line: rgba(255, 255, 255, 0.055);
+}
+
+:root[data-theme="light"] {
+  --bg-base: #f2f3f5;
+  --bg-surface: #ffffff;
+  --bg-surface-2: #f8f9fb;
+  --bg-hover: #ececf1;
+
+  --line-subtle: #e4e6ea;
+  --line: #d4d7dd;
+  --line-strong: #b7bcc5;
+
+  --ink: #1b1f26;
+  --ink-secondary: #5c6472;
+  --ink-tertiary: #848d9b;
+
+  --accent: #b8823c;
+  --accent-hover: #a5762f;
+  --accent-active: #8f6527;
+  --accent-on: #ffffff;
+  --accent-subtle: #f3e6d2;
+  --accent-subtle-text: #8f6527;
+
+  --success: #4f7d58;
+  --success-bg: #e6efe7;
+  --info: #4f6a8f;
+  --info-bg: #e6ebf2;
+  --warning: #8a6f3f;
+  --warning-bg: #f1e9d8;
+  --danger: #a34c4c;
+  --danger-bg: #f3e3e3;
+  --neutral: #5c6472;
+  --neutral-bg: #e9eaed;
+
+  --type-epic: #6c5a9e;
+  --type-epic-bg: #ece8f5;
+  --type-story: #3f7d6c;
+  --type-story-bg: #e3f0eb;
+  --type-task: #4f6a8f;
+  --type-task-bg: #e6ecf3;
+  --type-subtask: #5c6472;
+  --type-subtask-bg: #e9eaed;
+
+  --shadow-card: 0 1px 2px rgba(20, 23, 28, 0.08);
+  --shadow-card-hover: 0 8px 20px rgba(20, 23, 28, 0.12);
+  --shadow-elevated: 0 12px 32px rgba(20, 23, 28, 0.14), 0 2px 8px rgba(20, 23, 28, 0.08);
+
+  --grid-line: rgba(20, 23, 28, 0.06);
+}
+
+@theme inline {
+  --color-base: var(--bg-base);
+  --color-surface: var(--bg-surface);
+  --color-surface-2: var(--bg-surface-2);
+  --color-hover: var(--bg-hover);
+
+  --color-line-subtle: var(--line-subtle);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  --color-ink: var(--ink);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-tertiary: var(--ink-tertiary);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-active: var(--accent-active);
+  --color-accent-on: var(--accent-on);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-accent-subtle-text: var(--accent-subtle-text);
+
+  --color-success: var(--success);
+  --color-success-bg: var(--success-bg);
+  --color-info: var(--info);
+  --color-info-bg: var(--info-bg);
+  --color-warning: var(--warning);
+  --color-warning-bg: var(--warning-bg);
+  --color-danger: var(--danger);
+  --color-danger-bg: var(--danger-bg);
+  --color-neutral: var(--neutral);
+  --color-neutral-bg: var(--neutral-bg);
+
+  --color-type-epic: var(--type-epic);
+  --color-type-epic-bg: var(--type-epic-bg);
+  --color-type-story: var(--type-story);
+  --color-type-story-bg: var(--type-story-bg);
+  --color-type-task: var(--type-task);
+  --color-type-task-bg: var(--type-task-bg);
+  --color-type-subtask: var(--type-subtask);
+  --color-type-subtask-bg: var(--type-subtask-bg);
+
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --shadow-card: var(--shadow-card);
+  --shadow-card-hover: var(--shadow-card-hover);
+  --shadow-elevated: var(--shadow-elevated);
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg-base);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--accent-subtle);
+  color: var(--accent-subtle-text);
+}
+
+/* One focus-ring rule, everywhere — the quality-floor requirement, not
+   left to each component to remember its own outline. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The project-wide texture — applied alongside bg-base on every
+   top-level screen container (see (shell)/layout.tsx, login/signup
+   pages, LandingPage.tsx). Deliberately faint (~5-6% line opacity) so
+   it reads as texture behind dense card grids, not as a pattern
+   fighting for attention. Reads --grid-line so it re-tints for free
+   under whichever theme layer is active. */
+.bg-grid {
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -1,16 +1,30 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { IBM_Plex_Mono, IBM_Plex_Sans } from "next/font/google";
 import "./globals.css";
 import { AuthProvider } from "../lib/auth-context";
+import { ThemeProvider } from "../lib/theme-context";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+// Runs before React hydrates so the very first paint already has the
+// right theme — without this, the page would flash light-then-dark (or
+// vice versa) as soon as ThemeProvider reads localStorage. Kept as a
+// plain inline script, not a library: the whole logic is "read one key,
+// default to dark," not worth a dependency.
+const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem('wrkbase-theme');document.documentElement.setAttribute('data-theme', t==='light'?'light':'dark');}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();`;
+
+// IBM Plex over Inter/Geist: drawn by IBM for technical/engineering
+// systems, not picked as a safe default. Sans for UI, Mono for anything
+// that's a value — ticket ids, timestamps, status codes — see
+// app/(shell)/projects/[projectId]/page.tsx for where that split matters.
+const plexSans = IBM_Plex_Sans({
+  variable: "--font-plex-sans",
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const plexMono = IBM_Plex_Mono({
+  variable: "--font-plex-mono",
   subsets: ["latin"],
+  weight: ["400", "500", "600"],
 });
 
 export const metadata: Metadata = {
@@ -24,12 +38,14 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col">
-        <AuthProvider>{children}</AuthProvider>
+    <html lang="en" className={`${plexSans.variable} ${plexMono.variable} h-full antialiased`}>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
+      <body className="min-h-full flex flex-col font-sans">
+        <ThemeProvider>
+          <AuthProvider>{children}</AuthProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

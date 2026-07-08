@@ -69,22 +69,20 @@ function SignupForm() {
   }
 
   if (preview === "loading") {
-    return <p className="text-sm text-zinc-600 dark:text-zinc-400">Checking invite...</p>;
+    return <p className="text-sm text-ink-tertiary">Checking invite…</p>;
   }
 
   if (preview === "invalid") {
     return (
       <div className="flex w-full max-w-sm flex-col items-center gap-4 text-center">
-        <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">
-          Invite link invalid
-        </h1>
-        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        <h1 className="text-xl font-bold tracking-tight text-ink">Invite link invalid</h1>
+        <p className="text-sm text-ink-secondary">
           This invite link is invalid, expired, or has already been used. Ask whoever invited you
           to send a new one, or create your own workspace instead.
         </p>
         <a
           href="/signup"
-          className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+          className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
         >
           Create a workspace
         </a>
@@ -94,58 +92,63 @@ function SignupForm() {
 
   return (
     <>
-      <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">
-        {preview ? `You've been invited to join ${preview.org_name}` : "Create your workspace"}
-      </h1>
+      <div className="flex items-center gap-2">
+        <span className="h-2 w-2 rounded-sm bg-accent shadow-[0_0_10px_var(--accent)]" aria-hidden="true" />
+        <h1 className="text-xl font-bold tracking-tight text-ink">
+          {preview ? `You've been invited to join ${preview.org_name}` : "Create your workspace"}
+        </h1>
+      </div>
       <form
         onSubmit={handleSubmit}
-        className="flex w-full max-w-sm flex-col gap-4 rounded-xl border border-black/[.08] p-6 dark:border-white/[.145]"
+        className="flex w-full max-w-sm flex-col gap-4 rounded-lg border border-line bg-surface p-6 shadow-[var(--shadow-elevated)]"
       >
         {!preview && (
-          <label className="flex flex-col gap-1 text-sm">
+          <label className="flex flex-col gap-1.5 text-sm text-ink-secondary">
             Organization name
             <input
-              className="rounded-md border border-black/[.08] px-3 py-2 dark:border-white/[.145] dark:bg-zinc-900"
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
               value={orgName}
               onChange={(e) => setOrgName(e.target.value)}
               required
             />
           </label>
         )}
-        <label className="flex flex-col gap-1 text-sm">
+        <label className="flex flex-col gap-1.5 text-sm text-ink-secondary">
           Email
           <input
             type="email"
             disabled={!!preview}
-            className="rounded-md border border-black/[.08] px-3 py-2 disabled:opacity-60 dark:border-white/[.145] dark:bg-zinc-900"
+            className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong disabled:opacity-60"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             required
           />
         </label>
-        <label className="flex flex-col gap-1 text-sm">
+        <label className="flex flex-col gap-1.5 text-sm text-ink-secondary">
           Password
           <input
             type="password"
             minLength={8}
-            className="rounded-md border border-black/[.08] px-3 py-2 dark:border-white/[.145] dark:bg-zinc-900"
+            className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
           />
         </label>
-        {error && <p className="text-sm text-red-500">{error}</p>}
+        {error && (
+          <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
+        )}
         <button
           type="submit"
           disabled={submitting}
-          className="rounded-full bg-foreground px-5 py-2 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
+          className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
         >
-          {submitting ? "Creating account..." : preview ? "Join workspace" : "Sign up"}
+          {submitting ? "Creating account…" : preview ? "Join workspace" : "Sign up"}
         </button>
       </form>
-      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+      <p className="text-sm text-ink-secondary">
         Already have a workspace?{" "}
-        <a href="/login" className="font-medium text-black dark:text-zinc-50">
+        <a href="/login" className="font-medium text-ink hover:text-accent">
           Log in
         </a>
       </p>
@@ -155,11 +158,11 @@ function SignupForm() {
 
 export default function SignupPage() {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-6 bg-zinc-50 font-sans dark:bg-black">
+    <div className="bg-grid flex flex-1 flex-col items-center justify-center gap-6 bg-base px-4">
       {/* useSearchParams requires a Suspense boundary in the App Router —
           without it, the page opts the whole route out of static
           rendering with a build-time warning. */}
-      <Suspense fallback={<p className="text-sm text-zinc-600 dark:text-zinc-400">Loading...</p>}>
+      <Suspense fallback={<p className="text-sm text-ink-tertiary">Loading…</p>}>
         <SignupForm />
       </Suspense>
     </div>
