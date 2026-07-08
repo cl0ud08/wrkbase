@@ -6,9 +6,18 @@ from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
-from app.db.models import Organization, Project, Ticket, TicketType, User, UserRole, WorkflowState
+from app.db.models import (
+    Organization,
+    Project,
+    Sprint,
+    Ticket,
+    TicketType,
+    User,
+    UserRole,
+    WorkflowState,
+)
 from app.db.session import get_db
-from app.schemas.ticket import TicketCreate, TicketRead, TicketTreeNode, TicketUpdate
+from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
 
 router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
 
@@ -27,8 +36,11 @@ _TICKET_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=
 # what a ticket actually says (title/description/type/parent) stays
 # creator-or-admin, same as Projects. A request touching both a
 # collaborative field and a content field is treated as a content edit —
-# the stricter rule wins.
-_COLLABORATIVE_FIELDS = {"workflow_state_id", "position", "assignee_id"}
+# the stricter rule wins. sprint_id/story_points join this set for the
+# same reason: dragging a card into a sprint or jotting down an estimate
+# is planning collaboration, not a content edit, the same class as
+# dragging a card between board columns.
+_COLLABORATIVE_FIELDS = {"workflow_state_id", "position", "assignee_id", "sprint_id", "story_points"}
 
 
 async def _get_project_or_404(
@@ -161,6 +173,25 @@ async def _validate_assignee(db: AsyncSession, org_id: uuid.UUID, assignee_id: u
         )
 
 
+async def _validate_sprint(db: AsyncSession, project_id: uuid.UUID, sprint_id: uuid.UUID) -> None:
+    # Same shape as _validate_workflow_state: the composite FK (migration
+    # 0012) already guarantees this at the DB level, but checking first
+    # turns a bad id into a clean 422 instead of a raw IntegrityError. Does
+    # NOT check sprint status here — a completed sprint is a valid, if
+    # unusual, direct assignment target via plain PATCH (the dedicated
+    # bulk-assign endpoint in app/api/sprints.py is the one that blocks
+    # completed sprints, since that's the actual "planning" entry point;
+    # this one is closer to an admin/cleanup escape hatch).
+    result = await db.execute(
+        select(Sprint).where(Sprint.id == sprint_id, Sprint.project_id == project_id)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="sprint_id must reference an existing sprint in this project",
+        )
+
+
 async def _get_default_workflow_state(db: AsyncSession, project_id: uuid.UUID) -> WorkflowState:
     result = await db.execute(
         select(WorkflowState).where(
@@ -226,6 +257,9 @@ async def create_ticket(
     if payload.assignee_id is not None:
         await _validate_assignee(db, auth.org_id, payload.assignee_id)
 
+    if payload.sprint_id is not None:
+        await _validate_sprint(db, project_id, payload.sprint_id)
+
     ticket_number = await _next_ticket_number(db, auth.org_id)
 
     ticket = Ticket(
@@ -238,6 +272,8 @@ async def create_ticket(
         workflow_state_id=workflow_state_id,
         position=position,
         assignee_id=payload.assignee_id,
+        sprint_id=payload.sprint_id,
+        story_points=payload.story_points,
         ticket_number=ticket_number,
         created_by=auth.user_id,
     )
@@ -298,6 +334,35 @@ async def get_ticket_tree(
     return roots
 
 
+@router.get("/backlog", response_model=TicketPage)
+async def get_backlog(
+    project_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> TicketPage:
+    # Registered before "/{ticket_id}", same routing-order reasoning as
+    # /tree above — a literal path segment has to come before the
+    # catch-all UUID param or FastAPI never reaches this route.
+    await _get_project_or_404(db, project_id)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    # Backlog = sprint_id IS NULL, full stop — not "or its sprint is
+    # completed." complete_sprint (app/api/sprints.py) already sets
+    # sprint_id back to NULL for anything unfinished when a sprint wraps
+    # up, so a ticket that's still attached to a completed sprint is
+    # exactly the tickets that *did* finish — real history, not backlog.
+    base = select(Ticket).where(
+        Ticket.project_id == project_id, Ticket.sprint_id.is_(None), Ticket.deleted_at.is_(None)
+    )
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+    result = await db.execute(base.order_by(Ticket.created_at).limit(limit).offset(offset))
+    items = list(result.scalars().all())
+    return TicketPage(items=items, total=total, limit=limit, offset=offset)
+
+
 @router.get("/{ticket_id}", response_model=TicketRead)
 async def get_ticket(
     project_id: uuid.UUID,
@@ -335,6 +400,9 @@ async def update_ticket(
 
     if update_data.get("assignee_id") is not None:
         await _validate_assignee(db, auth.org_id, update_data["assignee_id"])
+
+    if update_data.get("sprint_id") is not None:
+        await _validate_sprint(db, project_id, update_data["sprint_id"])
 
     for field, value in update_data.items():
         setattr(ticket, field, value)

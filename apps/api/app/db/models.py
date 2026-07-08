@@ -1,8 +1,8 @@
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import DateTime, Enum, FetchedValue, ForeignKey, String, text
+from sqlalchemy import Date, DateTime, Enum, FetchedValue, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,6 +20,12 @@ class TicketType(str, enum.Enum):
     STORY = "story"
     TASK = "task"
     SUBTASK = "subtask"
+
+
+class SprintStatus(str, enum.Enum):
+    PLANNED = "planned"
+    ACTIVE = "active"
+    COMPLETED = "completed"
 
 
 class Organization(Base):
@@ -174,6 +180,45 @@ class WorkflowState(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
 
 
+class Sprint(Base):
+    """A time-boxed planning window for one project.
+
+    No eager_defaults, no updated_at: nothing here is trigger-maintained
+    (status changes are set directly by application code — see
+    app/api/sprints.py — same reasoning as Invite above).
+    """
+
+    __tablename__ = "sprints"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    # No single-column FK on org_id/project_id — same composite-FK
+    # reasoning as WorkflowState: the real constraint is (project_id,
+    # org_id) -> projects(id, org_id) in migration 0012.
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    goal: Mapped[str | None] = mapped_column(String, nullable=True)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # create_type=False / values_callable: same enum-wiring reasoning as
+    # UserRole/TicketType above. Status only ever changes through
+    # start_sprint/complete_sprint (app/api/sprints.py), never a plain
+    # PATCH — see SprintUpdate's docstring for why.
+    status: Mapped[SprintStatus] = mapped_column(
+        Enum(
+            SprintStatus,
+            name="sprint_status",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        server_default=SprintStatus.PLANNED.value,
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
 class Ticket(Base):
     __tablename__ = "tickets"
     # Applied proactively this time — this is exactly the Projects-slice
@@ -236,6 +281,18 @@ class Ticket(Base):
     # org's ticket_prefix on the frontend to render "WRK-142". Set once at
     # creation from Organization.next_ticket_number, never changes after.
     ticket_number: Mapped[int] = mapped_column(nullable=False)
+    # No single-column FK — same composite-FK reasoning as
+    # workflow_state_id: the real constraint is (sprint_id, project_id) ->
+    # sprints(id, project_id) in migration 0012. NULL = backlog. Also goes
+    # back to NULL automatically for tickets not in the project's terminal
+    # workflow state when their sprint completes — see complete_sprint in
+    # app/api/sprints.py.
+    sprint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Nullable: estimation is optional, and unestimated tickets shouldn't
+    # silently count as zero-effort in a sprint's total_points — see
+    # _total_points in app/api/sprints.py, which sums only non-NULL values
+    # (Postgres SUM already ignores NULLs, so this falls out for free).
+    story_points: Mapped[int | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()
