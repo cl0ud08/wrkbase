@@ -277,6 +277,19 @@ jobs:
       - name: Verify WebSocket pub/sub fan-out
         run: python -m scripts.verify_ws_pubsub
 
+      - name: Reset rate limiter (notifications)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 2 slice 3: notifications created at both real trigger points
+      # (assignment, invite acceptance) with the right payload, isolated by
+      # org AND by recipient specifically (not just org -- the actual
+      # privacy boundary notifications' per-command RLS, migration 0016, is
+      # built around), delivered live over the new /ws/notifications room
+      # to the right user only, and never leaking onto the unrelated
+      # project board channel even for the exact same mutating request.
+      - name: Verify notifications
+        run: python -m scripts.verify_notifications
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
