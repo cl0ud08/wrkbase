@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import Date, DateTime, Enum, FetchedValue, ForeignKey, String, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -26,6 +26,16 @@ class SprintStatus(str, enum.Enum):
     PLANNED = "planned"
     ACTIVE = "active"
     COMPLETED = "completed"
+
+
+class NotificationType(str, enum.Enum):
+    ASSIGNMENT = "assignment"
+    INVITE_ACCEPTED = "invite_accepted"
+    # Not created anywhere yet — this app has no comments/mentions feature
+    # to trigger it. Included in the enum now (see migration 0016) so
+    # that feature doesn't also need a migration just to add the label;
+    # deferred, not speculative code sitting unused.
+    MENTION = "mention"
 
 
 class Organization(Base):
@@ -465,3 +475,47 @@ class EmailVerificationToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+class Notification(Base):
+    """An event for one specific recipient (user_id) — an assignment, an
+    accepted invite, eventually a mention. See app/services/notifications.py
+    for why this table's RLS (migration 0016) is shaped differently from
+    every other table in this app: creation always happens on behalf of
+    someone other than the currently-authenticated actor, so INSERT is
+    scoped to org only, while SELECT/UPDATE are scoped to org *and*
+    recipient — the actual privacy boundary, since nothing in this app has
+    a legitimate reason for one user to read another's notifications.
+    """
+
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    # No composite FK to a project — a notification isn't project-scoped
+    # (invite_accepted has no project at all); user_id's composite FK to
+    # (users.id, org_id) below is this row's only structural scope beyond
+    # org_id itself.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    type: Mapped[NotificationType] = mapped_column(
+        Enum(
+            NotificationType,
+            name="notification_type",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+    )
+    # Deliberately minimal and type-specific — enough to render the
+    # notification and link to the relevant resource, never a second copy
+    # of data the real resource endpoint already serves. See
+    # app/services/notifications.py for the exact shape per type.
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )

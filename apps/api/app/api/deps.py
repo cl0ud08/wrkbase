@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
-from app.db.session import get_db, set_tenant_context
+from app.db.session import get_db, set_actor_context, set_tenant_context
 
 
 class AuthContext(BaseModel):
@@ -50,4 +50,8 @@ async def get_current_auth(
     # resolve to the exact same AsyncSession/connection for the request —
     # the tenant context set here is visible to every query the route makes.
     await set_tenant_context(db, auth.org_id)
+    # Notifications' RLS (migration 0016) additionally scopes SELECT/UPDATE
+    # to the acting user, not just their org — this is the one place that
+    # context is established for every real authenticated request.
+    await set_actor_context(db, auth.user_id)
     return auth
