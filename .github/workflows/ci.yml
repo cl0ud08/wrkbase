@@ -394,6 +394,20 @@ jobs:
       - name: Verify ticket triage
         run: python -m scripts.verify_triage
 
+      - name: Reset rate limiter (ticket parse)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 3 slice 3: the natural-language ticket-parse endpoint.
+      # Synchronous (see app/api/tickets.py's parse_ticket docstring for
+      # why, unlike triage above), so no extra worker/stub startup is
+      # needed here beyond what's already running -- this hits the same
+      # API process (already pointed at the stub via this job's own
+      # GROQ_BASE_URL/GEMINI_BASE_URL env) and the same worker processes
+      # started earlier for the parse-then-confirm check's async-triage
+      # composition proof.
+      - name: Verify ticket parse
+        run: python -m scripts.verify_ticket_parse
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
