@@ -1,7 +1,6 @@
-"""Consumes ticket-triage jobs off RabbitMQ. No LLM call yet (Phase 3
-slice 1: prove the plumbing) — every job gets a hardcoded placeholder
-priority, deliberately not derived from the ticket's actual content, so
-nothing about this slice's result could be mistaken for real triage.
+"""Consumes ticket-triage jobs off RabbitMQ, calling a real LLM (Groq
+first, Gemini as fallback — see app/services/llm_triage.py) to classify
+each ticket.
 
 Run: python -m worker.main (see docker-compose.yml's worker service —
 same image and codebase as the api service, just a different command).
@@ -23,10 +22,11 @@ not merely inherited:
     for this to happen, it's the broker's own behavior on a dropped
     connection. The job gets redelivered to another consumer (or this one
     again, once restarted). No silent data loss.
-  - **A caught exception** during processing (this process survives, but
-    something failed) explicitly nacks with `requeue=True` below — same
-    outcome, deliberately, rather than swallowing the error and acking
-    anyway (which would silently drop a job that never actually ran).
+  - **A caught infrastructure exception** during processing (this process
+    survives, but something failed) explicitly nacks with `requeue=True`
+    below — same outcome, deliberately, rather than swallowing the error
+    and acking anyway (which would silently drop a job that never
+    actually ran).
   - **Acking before the DB write**, or `no_ack=True`, would have been the
     wrong default to accept: either loses the job forever on a crash
     between "received" and "processed," for a use case where losing a
@@ -35,12 +35,30 @@ not merely inherited:
 The tradeoff this accepts: **at-least-once, not exactly-once** delivery.
 If this process crashes after committing the DB update but before the
 ack frame actually reaches the broker (a narrow window), the job gets
-redelivered and reprocessed — for this slice's idempotent-ish placeholder
-write (re-setting priority/triaged_at to materially the same values) that's
-harmless; for a real LLM call (next slice) it means occasionally paying
-for a duplicate call, a real but accepted cost, not a correctness bug.
-Exactly-once would need an idempotency key and a dedup check — worth
-building once real LLM cost makes it worth it, not for this slice.
+redelivered and reprocessed — now that a real LLM call sits behind this,
+that means occasionally paying for a duplicate call, a real but accepted
+cost, not a correctness bug. Exactly-once would need an idempotency key
+and a dedup check — worth building if that cost ever actually matters,
+not speculatively here.
+
+--- A failed LLM call is a handled outcome, not an infrastructure
+    failure — and never nack-and-requeue's problem to solve -----------
+
+This is the one place this slice changes the ack/nack picture above:
+`_process_job` catches `TriageFailed` (both providers exhausted their
+retry budgets — see llm_triage.py) *inside itself*, writes a real
+`triage_status = 'failed'` + `triage_error` to the ticket, commits,
+publishes the live update, and returns normally. From the outer loop's
+point of view that's success — the message gets ack'd, same as an
+ordinary completed triage. Deliberately not raised up to the generic
+`except Exception: nack(requeue=True)` handler below: doing that would
+mean every redelivery pays for a fresh 2-attempt-per-provider budget
+against a job that has already been shown, at least once, not to
+succeed — an unbounded, silently expensive retry loop dressed up as
+"reliability." `nack(requeue=True)` stays reserved for genuine
+infrastructure failures unrelated to the LLM call itself (a DB hiccup
+writing the result, a network blip) — the same class of transient
+failure it was always meant for.
 
 --- Two workers running at once: does the same job ever get processed
     twice? ---------------------------------------------------------------
@@ -99,8 +117,9 @@ import aio_pika
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.db.models import Ticket, TicketPriority
+from app.db.models import Ticket, TriageStatus
 from app.db.session import AsyncSessionLocal, set_tenant_context
+from app.services.llm_triage import TriageFailed, triage_ticket
 from app.services.queue import TRIAGE_QUEUE_NAME, TriageJob
 from app.services.ticket_events import SYSTEM_ACTOR_ID, publish_ticket_update
 
@@ -122,11 +141,29 @@ async def _process_job(job: TriageJob) -> None:
                 "already deleted, or a malformed/stale job"
             )
 
-        # Hardcoded, not derived from ticket.title/description at all —
-        # this slice proves the queue/worker/live-update plumbing, not
-        # triage quality. Real prioritization is the next slice, once an
-        # LLM is actually in the loop.
-        ticket.priority = TicketPriority.MEDIUM
+        try:
+            triage_result, provider = await triage_ticket(job.title, job.description)
+        except TriageFailed as exc:
+            # A handled, terminal outcome -- see module docstring's
+            # "failed LLM call" section for why this returns normally
+            # (ack'd) instead of propagating to the nack(requeue=True)
+            # path below.
+            ticket.triage_status = TriageStatus.FAILED
+            ticket.triage_error = str(exc)
+            await session.commit()
+            await publish_ticket_update(
+                project_id=ticket.project_id,
+                ticket_id=ticket.id,
+                changes={"triage_status": ticket.triage_status, "triage_error": ticket.triage_error},
+                updated_by=SYSTEM_ACTOR_ID,
+            )
+            logger.error("triage failed for ticket=%s: %s", ticket.id, exc)
+            return
+
+        ticket.triage_status = TriageStatus.TRIAGED
+        ticket.priority = triage_result.priority
+        ticket.labels = triage_result.labels
+        ticket.triage_reasoning = triage_result.reasoning
         ticket.triaged_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -138,10 +175,22 @@ async def _process_job(job: TriageJob) -> None:
         await publish_ticket_update(
             project_id=ticket.project_id,
             ticket_id=ticket.id,
-            changes={"priority": ticket.priority, "triaged_at": ticket.triaged_at},
+            changes={
+                "triage_status": ticket.triage_status,
+                "priority": ticket.priority,
+                "labels": ticket.labels,
+                "triage_reasoning": ticket.triage_reasoning,
+                "triaged_at": ticket.triaged_at,
+            },
             updated_by=SYSTEM_ACTOR_ID,
         )
-        logger.info("triaged ticket=%s org=%s priority=%s", ticket.id, job.org_id, ticket.priority.value)
+        logger.info(
+            "triaged ticket=%s org=%s via=%s priority=%s",
+            ticket.id,
+            job.org_id,
+            provider,
+            ticket.priority.value,
+        )
 
 
 async def main() -> None:

@@ -23,6 +23,7 @@ import {
   mapWorkflowState,
   type Member,
   type Ticket,
+  type TicketPriority,
   type TicketType,
   type WorkflowState,
 } from "../../../../lib/types";
@@ -50,6 +51,73 @@ function TypeBadge({ type }: { type: TicketType }) {
     >
       {style.label}
     </span>
+  );
+}
+
+// Mapped onto this app's existing semantic tokens (danger/warning/info/
+// neutral), not a new priority-specific palette — critical genuinely is
+// this app's "danger" concept, not a fifth color needing its own meaning.
+const PRIORITY_STYLE: Record<TicketPriority, { label: string; text: string; bg: string }> = {
+  critical: { label: "Critical", text: "text-danger", bg: "bg-danger-bg" },
+  high: { label: "High", text: "text-warning", bg: "bg-warning-bg" },
+  medium: { label: "Medium", text: "text-info", bg: "bg-info-bg" },
+  low: { label: "Low", text: "text-neutral", bg: "bg-neutral-bg" },
+};
+
+function PriorityBadge({ priority }: { priority: TicketPriority }) {
+  const style = PRIORITY_STYLE[priority];
+  return (
+    <span
+      className={`rounded-sm px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide uppercase ${style.text} ${style.bg}`}
+    >
+      {style.label}
+    </span>
+  );
+}
+
+// pending_triage/triaged/failed clears or updates itself the instant the
+// worker's live update arrives over the board's own WebSocket connection
+// — no polling, no separate fetch, the exact same onmessage splice every
+// other live board update already uses.
+function TriageIndicator({ ticket }: { ticket: Ticket }) {
+  if (ticket.triageStatus === "pending") {
+    return (
+      <div className="mb-2 flex items-center gap-1.5 text-[10px] text-ink-tertiary">
+        <span className="h-1 w-1 flex-shrink-0 animate-pulse rounded-full bg-accent" aria-hidden="true" />
+        AI triaging…
+      </div>
+    );
+  }
+  if (ticket.triageStatus === "failed") {
+    return (
+      <div
+        className="mb-2 flex items-center gap-1.5 text-[10px] text-danger"
+        title={ticket.triageError ?? "Triage failed"}
+      >
+        <span className="h-1 w-1 flex-shrink-0 rounded-full bg-danger" aria-hidden="true" />
+        Triage failed
+      </div>
+    );
+  }
+  // triaged: real priority (never absent once triageStatus is "triaged"
+  // — both are always set together, see worker/main.py) plus any
+  // suggested labels, title-tooltipped with the model's own one-sentence
+  // reasoning so a human can see *why*, not just trust the badge.
+  return (
+    <div
+      className="mb-2 flex flex-wrap items-center gap-1"
+      title={ticket.triageReasoning ?? undefined}
+    >
+      {ticket.priority && <PriorityBadge priority={ticket.priority} />}
+      {ticket.labels?.map((label) => (
+        <span
+          key={label}
+          className="rounded-sm bg-hover px-1.5 py-0.5 font-mono text-[10px] text-ink-tertiary"
+        >
+          {label}
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -106,16 +174,7 @@ function Card({
         <TypeBadge type={ticket.type} />
       </div>
       <p className="mb-2 leading-snug text-ink">{ticket.title}</p>
-      {/* pending_triage (both null together) clears itself the instant the
-          worker's live update arrives over the board's own WebSocket
-          connection — no polling, no separate fetch, the exact same
-          onmessage splice every other live board update already uses. */}
-      {ticket.triagedAt === null && (
-        <div className="mb-2 flex items-center gap-1.5 text-[10px] text-ink-tertiary">
-          <span className="h-1 w-1 flex-shrink-0 animate-pulse rounded-full bg-accent" aria-hidden="true" />
-          AI triaging…
-        </div>
-      )}
+      <TriageIndicator ticket={ticket} />
       <div className="flex items-center justify-between gap-2">
         <span
           title={assignee ? assignee.email : "Unassigned"}

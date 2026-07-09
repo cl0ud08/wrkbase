@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import Date, DateTime, Enum, FetchedValue, ForeignKey, String, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -27,6 +27,15 @@ class TicketPriority(str, enum.Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+
+
+class TriageStatus(str, enum.Enum):
+    PENDING = "pending"
+    TRIAGED = "triaged"
+    # A real, distinct terminal outcome, not a retry-forever loop: both
+    # providers were tried and exhausted their retry budgets — see
+    # worker/main.py and app/services/llm_triage.py.
+    FAILED = "failed"
 
 
 class SprintStatus(str, enum.Enum):
@@ -331,11 +340,25 @@ class Ticket(Base):
     # _total_points in app/api/sprints.py, which sums only non-NULL values
     # (Postgres SUM already ignores NULLs, so this falls out for free).
     story_points: Mapped[int | None] = mapped_column(nullable=True)
-    # NULL = pending_triage; set once, together with triaged_at, by
-    # worker/main.py — never settable via TicketCreate/TicketUpdate. This
-    # slice hardcodes a placeholder value rather than calling a real LLM
-    # (see worker/main.py) — the column and its async plumbing are what
-    # this slice actually proves, not triage quality.
+    # The authoritative triage state (migration 0018) — not triaged_at
+    # IS NULL anymore. A real LLM call (app/services/llm_triage.py) can
+    # fail outright after both providers' retry budgets are exhausted,
+    # which is a genuine third outcome, distinct from still-pending, that
+    # the old two-nullable-columns idiom had no way to express.
+    triage_status: Mapped[TriageStatus] = mapped_column(
+        Enum(
+            TriageStatus,
+            name="triage_status",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        server_default=TriageStatus.PENDING.value,
+    )
+    # Set together, once, only on a successful triage — never settable via
+    # TicketCreate/TicketUpdate. See app/services/llm_triage.py for the
+    # Groq-primary/Gemini-fallback call and the validation every response
+    # goes through regardless of which provider produced it.
     priority: Mapped[TicketPriority | None] = mapped_column(
         Enum(
             TicketPriority,
@@ -345,10 +368,20 @@ class Ticket(Base):
         ),
         nullable=True,
     )
-    # NULL = pending_triage, non-NULL = triaged — the same nullable-
-    # timestamp-as-state idiom as accepted_at/read_at/used_at elsewhere in
-    # this app, not a new status enum (see migration 0017 for why a third
-    # state isn't needed yet).
+    # A native array of short strings, not JSONB and not a join table —
+    # see migration 0018 for the tradeoff. LLM-suggested, no independent
+    # identity of their own yet.
+    labels: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    # One sentence explaining the priority choice — visible so a human can
+    # see *why*, not just trust the result. No comment system exists in
+    # this app (checked, not assumed) to attach this to instead.
+    triage_reasoning: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Set only when triage_status = 'failed' — real visibility into why a
+    # ticket is stuck, not a silent dead end (see worker/main.py).
+    triage_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Non-NULL only once triage_status = 'triaged' — kept as a genuine
+    # "when did this complete" timestamp now that triage_status is the
+    # actual state signal, not a second copy of it.
     triaged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(

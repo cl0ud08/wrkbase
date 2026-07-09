@@ -34,13 +34,22 @@ class Settings(BaseSettings):
     redis_url: str
     rabbitmq_url: str
 
-    # Empty defaults, not required: this slice doesn't call either LLM yet
-    # (ticket-triage plumbing only — see worker/main.py's hardcoded
-    # placeholder priority), so nothing breaks with these unset. Never
-    # logged, never included in any response — see worker/main.py and
-    # app/services/queue.py for the only places these get read at all.
+    # Empty default, not required: some deploys of this app (a bare
+    # `worker` running the Slice-1 plumbing only, before anyone's added a
+    # key) shouldn't fail to boot over it. Never logged, never included in
+    # any response — see app/services/llm_triage.py for the only place
+    # these are read at all.
     groq_api_key: str = ""
     gemini_api_key: str = ""
+    # None = use each SDK's own real default endpoint. Overridden only by
+    # CI's plumbing-only proof run, pointed at a local stub server instead
+    # of the real providers — see scripts/_fake_llm_server.py and
+    # verify_triage.py for why: this is a completely ordinary, SDK-
+    # supported config knob (both AsyncGroq and genai.Client accept a
+    # custom base URL natively), not a special "mock mode" branch grafted
+    # onto production code.
+    groq_base_url: str | None = None
+    gemini_base_url: str | None = None
 
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"

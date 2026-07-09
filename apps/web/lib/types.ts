@@ -37,6 +37,7 @@ export function mapProject(data: ProjectApiResponse): Project {
 
 export type TicketType = "epic" | "story" | "task" | "subtask";
 export type TicketPriority = "low" | "medium" | "high" | "critical";
+export type TriageStatus = "pending" | "triaged" | "failed";
 
 export interface Ticket {
   id: string;
@@ -58,12 +59,19 @@ export interface Ticket {
   // null = in the backlog (see fetchBacklog / mapSprint below).
   sprintId: string | null;
   storyPoints: number | null;
-  // Both null together = pending_triage — the async worker (see
-  // apps/api/worker/main.py) hasn't set them yet. A ticket is always
-  // created this way; the board page renders an "AI triaging…" badge
-  // for exactly this state and clears it on the live update that sets
-  // both, no polling involved.
+  // The authoritative triage state — not "both null" anymore (see
+  // apps/api/app/db/models.py's Ticket.triage_status docstring): a real
+  // LLM call (apps/api/app/services/llm_triage.py) can fail outright
+  // after both providers are exhausted, a genuine third outcome the old
+  // two-nullable-fields idiom couldn't express. The board renders "AI
+  // triaging…" for pending, real priority/labels for triaged, and a
+  // distinct failed indicator for failed — all via the same live update
+  // mechanism, no polling.
+  triageStatus: TriageStatus;
   priority: TicketPriority | null;
+  labels: string[] | null;
+  triageReasoning: string | null;
+  triageError: string | null;
   triagedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -88,7 +96,11 @@ interface TicketApiResponse {
   ticket_number: number;
   sprint_id: string | null;
   story_points: number | null;
+  triage_status: TriageStatus;
   priority: TicketPriority | null;
+  labels: string[] | null;
+  triage_reasoning: string | null;
+  triage_error: string | null;
   triaged_at: string | null;
   created_at: string;
   updated_at: string;
@@ -110,7 +122,11 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     ticketNumber: data.ticket_number,
     sprintId: data.sprint_id,
     storyPoints: data.story_points,
+    triageStatus: data.triage_status,
     priority: data.priority,
+    labels: data.labels,
+    triageReasoning: data.triage_reasoning,
+    triageError: data.triage_error,
     triagedAt: data.triaged_at,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
@@ -158,7 +174,11 @@ export interface TicketUpdatedEvent {
       | "assigneeId"
       | "sprintId"
       | "storyPoints"
+      | "triageStatus"
       | "priority"
+      | "labels"
+      | "triageReasoning"
+      | "triageError"
       | "triagedAt"
     >
   >;
@@ -183,7 +203,11 @@ interface TicketUpdatedEventApiPayload {
     assignee_id?: string | null;
     sprint_id?: string | null;
     story_points?: number | null;
+    triage_status?: TriageStatus;
     priority?: TicketPriority;
+    labels?: string[];
+    triage_reasoning?: string;
+    triage_error?: string;
     triaged_at?: string;
   };
   updated_by: string;
@@ -196,7 +220,11 @@ export function mapTicketUpdatedEvent(data: TicketUpdatedEventApiPayload): Ticke
   if ("assignee_id" in data.changes) changes.assigneeId = data.changes.assignee_id ?? null;
   if ("sprint_id" in data.changes) changes.sprintId = data.changes.sprint_id ?? null;
   if ("story_points" in data.changes) changes.storyPoints = data.changes.story_points ?? null;
+  if ("triage_status" in data.changes) changes.triageStatus = data.changes.triage_status;
   if ("priority" in data.changes) changes.priority = data.changes.priority;
+  if ("labels" in data.changes) changes.labels = data.changes.labels;
+  if ("triage_reasoning" in data.changes) changes.triageReasoning = data.changes.triage_reasoning;
+  if ("triage_error" in data.changes) changes.triageError = data.changes.triage_error;
   if ("triaged_at" in data.changes) changes.triagedAt = data.changes.triaged_at;
   return {
     type: data.type,

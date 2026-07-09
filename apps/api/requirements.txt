@@ -11,6 +11,8 @@ email-validator==2.2.0
 httpx==0.28.1
 slowapi==0.1.9
 aio-pika==9.5.5
+groq==1.5.0
+google-genai==2.10.0
 
 # dev / CI only
 ruff==0.15.20

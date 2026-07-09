@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.db.models import TicketPriority, TicketType
+from app.db.models import TicketPriority, TicketType, TriageStatus
 
 
 class TicketCreate(BaseModel):
@@ -66,9 +66,16 @@ class TicketRead(BaseModel):
     # that sprint was completed — see complete_sprint in app/api/sprints.py.
     sprint_id: uuid.UUID | None
     story_points: int | None
-    # Both NULL together = pending_triage; set once, together, by
-    # worker/main.py — not settable via TicketCreate/TicketUpdate.
+    # The authoritative triage state — see Ticket.triage_status's
+    # docstring (migration 0018) for why this replaced triaged_at IS NULL.
+    triage_status: TriageStatus
+    # All four set together, once, only on success — not settable via
+    # TicketCreate/TicketUpdate. See app/services/llm_triage.py.
     priority: TicketPriority | None
+    labels: list[str] | None
+    triage_reasoning: str | None
+    # Set only when triage_status = 'failed'.
+    triage_error: str | None
     triaged_at: datetime | None
     created_at: datetime
     updated_at: datetime
