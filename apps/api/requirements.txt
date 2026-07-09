@@ -16,3 +16,8 @@ ruff==0.15.20
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pip-audit==2.10.1
+# Client-side WS support for scripts/verify_ws.py. Already present
+# transitively via uvicorn[standard] (it's uvicorn's own WS transport), but
+# pinned explicitly since a proof script importing it directly shouldn't
+# depend on staying compatible with whatever uvicorn happens to bundle.
+websockets==16.0

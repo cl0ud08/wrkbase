@@ -12,6 +12,7 @@ from app.api.projects import router as projects_router
 from app.api.sprints import router as sprints_router
 from app.api.tickets import router as tickets_router
 from app.api.workflow_states import router as workflow_states_router
+from app.api.ws import router as ws_router
 from app.core.config import settings
 from app.core.rate_limit import limiter
 
@@ -51,3 +52,4 @@ app.include_router(sprints_router)
 app.include_router(workflow_states_router)
 app.include_router(invites_router)
 app.include_router(org_router)
+app.include_router(ws_router)

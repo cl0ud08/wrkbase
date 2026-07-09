@@ -58,6 +58,13 @@ services:
       # rewrite proxy, which runs inside this container, so it needs the
       # internal docker-network address, not the host-mapped API_PORT.
       API_INTERNAL_URL: http://api:8000
+      # NEXT_PUBLIC_ (browser-visible) and deliberately a different address
+      # than API_INTERNAL_URL above: the browser itself opens this
+      # WebSocket connection directly to the API's own origin, bypassing
+      # the same-origin rewrite proxy entirely (see app/api/ws.py's module
+      # docstring for why), so it needs the host-facing API_PORT the
+      # browser can actually reach, not the internal docker-network one.
+      NEXT_PUBLIC_API_WS_URL: ws://localhost:${API_PORT}
     ports:
       - "${WEB_PORT}:3000"
     volumes:

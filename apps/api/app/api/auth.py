@@ -44,6 +44,7 @@ from app.schemas.auth import (
     SignupRequest,
     SignupResponse,
     TokenPair,
+    WsTicketResponse,
 )
 from app.services.refresh_tokens import (
     pop_refresh_token,
@@ -51,6 +52,7 @@ from app.services.refresh_tokens import (
     revoke_refresh_token,
     store_refresh_token,
 )
+from app.services.ws_tickets import issue_ws_ticket
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -547,7 +549,10 @@ async def me(
     count_result = await db.execute(select(func.count()).select_from(User))
     org_user_count = count_result.scalar_one()
 
-    # organizations has no RLS, so this is just a plain lookup by id.
+    # organizations has its own RLS too now (migration 0015), but tenant
+    # context is already set to auth.org_id by get_current_auth above, so
+    # this plain lookup by id resolves under select_own_org exactly as
+    # intended — no special handling needed here.
     org_result = await db.execute(select(Organization).where(Organization.id == auth.org_id))
     org = org_result.scalar_one()
 
@@ -566,3 +571,12 @@ async def me(
         # not to lock anything.
         "is_verified": user.is_verified,
     }
+
+
+@router.post("/ws-ticket", response_model=WsTicketResponse)
+async def create_ws_ticket(auth: AuthContext = Depends(get_current_auth)) -> WsTicketResponse:
+    # No rate limiting here, same as /auth/me and /auth/refresh: this is a
+    # routine authenticated action, not an unauthenticated or credential-
+    # guessing surface — the abuse those limits guard against.
+    ticket = await issue_ws_ticket(user_id=auth.user_id, org_id=auth.org_id, role=auth.role)
+    return WsTicketResponse(ticket=ticket)

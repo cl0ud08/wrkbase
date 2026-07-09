@@ -112,6 +112,13 @@ class ResendVerificationRequest(BaseModel):
         return value.lower()
 
 
+class WsTicketResponse(BaseModel):
+    # 30-second single-use credential for a WebSocket handshake — see
+    # app/services/ws_tickets.py for why this exists instead of the actual
+    # access token.
+    ticket: str
+
+
 class ResendVerificationResponse(BaseModel):
     # Same enumeration-safety shape as PasswordResetRequestResponse, and
     # for the same reason — this is public/unauthenticated and must not
