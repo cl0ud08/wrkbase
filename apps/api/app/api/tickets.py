@@ -18,6 +18,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
+from app.services.ticket_events import publish_ticket_update
 
 router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
 
@@ -408,6 +409,19 @@ async def update_ticket(
         setattr(ticket, field, value)
 
     await db.commit()
+
+    # Live-board fan-out: only the collaborative subset, even for a
+    # request that also touched a content field in the same PATCH (the
+    # stricter-rule-wins check above already gated the whole request on
+    # ownership for that case; this only decides what's worth pushing to
+    # everyone else's board in real time). Nothing to publish if this
+    # PATCH didn't touch any of them.
+    board_changes = {k: v for k, v in update_data.items() if k in _COLLABORATIVE_FIELDS}
+    if board_changes:
+        await publish_ticket_update(
+            project_id=project_id, ticket_id=ticket.id, changes=board_changes, updated_by=auth.user_id
+        )
+
     return ticket
 
 
