@@ -3,6 +3,7 @@
 import { usePathname, useRouter } from "next/navigation";
 
 import { useAuth } from "../../lib/auth-context";
+import NotificationBell from "../../components/NotificationBell";
 import ThemeToggle from "../../components/ThemeToggle";
 import VerificationBanner from "../../components/VerificationBanner";
 
@@ -80,6 +81,7 @@ export default function ShellLayout({ children }: { children: React.ReactNode })
             >
               {user.email}
             </span>
+            <NotificationBell />
             <ThemeToggle compact />
             <button
               onClick={handleLogout}

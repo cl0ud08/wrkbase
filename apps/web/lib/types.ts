@@ -329,3 +329,77 @@ interface InviteCreateApiResponse extends InviteApiResponse {
 export function mapInviteCreateResult(data: InviteCreateApiResponse): InviteCreateResult {
   return { ...mapInvite(data), token: data.token, link: data.link };
 }
+
+export type NotificationType = "assignment" | "invite_accepted" | "mention";
+
+export interface Notification {
+  id: string;
+  type: NotificationType;
+  // Deliberately untyped further than this: shape is type-specific (see
+  // apps/api/app/services/notifications.py), and the only two consumers
+  // (NotificationBell's renderer, keyed on `type`) already know which
+  // fields to expect for the type they're rendering.
+  payload: Record<string, unknown>;
+  readAt: string | null;
+  createdAt: string;
+}
+
+interface NotificationApiResponse {
+  id: string;
+  type: NotificationType;
+  payload: Record<string, unknown>;
+  read_at: string | null;
+  created_at: string;
+}
+
+export function mapNotification(data: NotificationApiResponse): Notification {
+  return {
+    id: data.id,
+    type: data.type,
+    payload: data.payload,
+    readAt: data.read_at,
+    createdAt: data.created_at,
+  };
+}
+
+export interface NotificationPage {
+  items: Notification[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+interface NotificationPageApiResponse {
+  items: NotificationApiResponse[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export function mapNotificationPage(data: NotificationPageApiResponse): NotificationPage {
+  return {
+    items: data.items.map(mapNotification),
+    total: data.total,
+    limit: data.limit,
+    offset: data.offset,
+  };
+}
+
+// Pushed over /ws/notifications (see apps/api/app/services/notifications.py)
+// the instant a notification is created — the live-update counterpart to
+// NotificationPage above.
+export interface NotificationCreatedEvent {
+  type: "notification.created";
+  notification: Notification;
+}
+
+interface NotificationCreatedEventApiPayload {
+  type: "notification.created";
+  notification: NotificationApiResponse;
+}
+
+export function mapNotificationCreatedEvent(
+  data: NotificationCreatedEventApiPayload,
+): NotificationCreatedEvent {
+  return { type: data.type, notification: mapNotification(data.notification) };
+}

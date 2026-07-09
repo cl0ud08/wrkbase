@@ -2169,3 +2169,195 @@ row.
 no fixups needed); `verify_auth_rls` and `verify_projects_rls` re-run
 as an adjacency check with no regressions; `ruff check .` clean;
 frontend `ESLint` and `tsc --noEmit` clean; a full `next build` clean.
+
+---
+
+## Slice 25 — Phase 2, slice 3: notifications, and a real test of
+whether the WebSocket infrastructure was ever general-purpose
+
+**Built:** a `notifications` table, two real trigger points (ticket
+assignment, invite acceptance — comment/mention support checked for
+and confirmed absent, so that trigger point is deferred, not built
+speculatively), `GET /notifications` / `/unread-count` / `PATCH
+/{id}/read` / `POST /read-all`, a new `/ws/notifications` room
+delivering them live, and a bell in the shell header. The largest
+slice in Phase 2, and the one that actually tested the premise Slice
+22–23 were built on: is this WebSocket/pub-sub layer genuinely
+general-purpose, or was it quietly shaped around ticket-move events
+specifically? Building a second, structurally different room is what
+answered that — see the architecture section below.
+
+**The RLS redesign, and why the obvious first design was wrong.**
+Every other RLS-protected table in this app has one shape: the acting
+user and the row's owner are the same axis, so `USING`/`WITH CHECK`
+both just compare `org_id` (or `org_id`+`project_id`) to the current
+session's context. The instinctive version of a "private to one user"
+policy is `org_id = current_org_id AND user_id = current_user_id`,
+checked everywhere, no per-command split — the same shape as `users`
+or `sprints`. That's wrong for this table, and tracing through the two
+real trigger points is what caught it before it shipped, not after: a
+notification is always created *for* someone other than whoever is
+currently authenticated. An admin PATCHes a ticket's `assignee_id` to
+a teammate — the teammate is the recipient, the admin is the actor. A
+new user redeems an invite — the admin who sent it is the recipient,
+in a request where that admin isn't authenticated at all. If
+`user_id = current_user_id` were required unconditionally, neither
+INSERT could ever succeed, because the acting user is essentially
+never the recipient for either real code path this table has. So,
+three per-command policies instead:
+
+- **INSERT** is scoped to org only (`org_id = current_org_id`).
+  Creating a notification for any real member of your own org isn't a
+  privacy leak — nothing is being *read* — and the composite FK to
+  `(users.id, org_id)` already guarantees the recipient genuinely
+  belongs to that org regardless of what this policy permits.
+- **SELECT/UPDATE** are scoped to org *and* recipient
+  (`org_id = current_org_id AND user_id = current_user_id`). This is
+  the actual privacy boundary: nothing in this app has a legitimate
+  reason for one user to read or mark-read another's notifications —
+  unlike soft-delete's restore path, there's no sanctioned exception,
+  which is exactly why this lives in RLS rather than an app-layer
+  `WHERE` clause someone could forget to add to a future endpoint.
+- **DELETE** is left unpoliced (default-deny), same as `organizations`
+  — nothing in this app ever deletes a notification row.
+
+`app.current_user_id` is a new session GUC (`set_actor_context`,
+`app/db/session.py`), set alongside the existing `app.current_org_id`
+in `get_current_auth` — the one real choke point for every
+authenticated HTTP request. Deliberately not folded into
+`set_tenant_context` itself: several existing call sites (self-serve
+signup, `scripts.seed`, invite redemption) run before any specific
+"acting user" exists at all, and notification *creation* deliberately
+runs as a different user than the recipient — folding user scoping
+into the org-scoping function would force a `user_id` onto call sites
+that have no coherent one to give it.
+
+**The second RETURNING-gated-by-SELECT-policy occurrence — same root
+cause as organizations (Slice 21), a structural mismatch this time,
+not a timing one.** The ORM's implicit `INSERT ... RETURNING`, used to
+read server-generated columns back after any `session.add()`, is
+gated by a table's SELECT policy in Postgres, not the INSERT policy
+that actually permitted the write. For `organizations` (Slice 21) the
+mismatch was timing: the org's `id` wasn't known until the INSERT
+itself completed, so `id = current_org_id` couldn't be satisfied yet.
+For `notifications` it's structural and permanent: the acting user
+creating a notification is essentially never its recipient, so
+`select_own_notifications`'s `user_id = current_user_id` would reject
+the RETURNING on *every single call*, for both trigger points this
+app has — there's no ordering fix that makes it eventually true.
+Fixed the same way conceptually (skip RETURNING entirely) but
+differently in practice: `create_notification`
+(`app/services/notifications.py`) generates `id` and `created_at`
+client-side and issues a raw `INSERT` with no `RETURNING` clause at
+all, rather than `session.add()`.
+
+**A real SQLAlchemy gotcha, found by running it, not by reading
+docs.** The raw INSERT's first draft used
+`VALUES (..., :type::notification_type, :payload::jsonb, ...)` —
+Postgres's own `::` cast syntax. SQLAlchemy's `text()` bind-parameter
+parser doesn't handle a `::` cast immediately following a named
+parameter: it left `:type::notification_type` completely
+unsubstituted and sent that literal string to asyncpg, which failed
+with a syntax error pointing at the `:` — a confusing error one step
+removed from the actual bug. Fixed with `CAST(:type AS
+notification_type)` / `CAST(:payload AS jsonb)` instead of `::`,
+which SQLAlchemy's parser has no trouble with. Confirmed via a direct
+smoke test against a real session before it was ever wired into an
+endpoint — the same "verify empirically, don't assume" discipline
+that caught the RETURNING issue above in the first place.
+
+**Centralized in one service, not inline in each endpoint.**
+`app/services/notifications.py` (`create_notification` +
+`publish_notification`) is called from two genuinely unrelated files —
+`tickets.py`'s `update_ticket` and `auth.py`'s `signup()` — that share
+no other code path and would otherwise each need to independently get
+the client-generated-id-plus-raw-INSERT shape right, and independently
+remember to publish only after a successful commit (a rolled-back
+change must never push a live "notification created" event for a row
+that doesn't exist — both callers construct the notification inside
+the same transaction as whatever triggered it, commit once, and only
+publish afterward). One place for that logic to be correct, the same
+reasoning `ticket_events.publish_ticket_update` already established
+for board events, generalized here to a service two unrelated parts of
+the codebase both depend on.
+
+**Point 3: why `/ws/projects/{id}` was the wrong shape, stated
+plainly, not forced into fitting.** The existing room is scoped by
+`project_id` and opened only when a user is looking at that specific
+project's board — `connectProjectSocket` is called from the board
+page's own `useEffect`, nowhere else. A notification has to reach a
+user regardless of what they're currently looking at: assigned a
+ticket in Project B while viewing Project A's board, or while on the
+dashboard or team page with no project open at all, where today there
+is no live connection whatsoever. Subscribing a user to *every*
+project their org has, just in case, would defeat the entire reason
+project-scoped channels exist (bounded, relevant subscriptions, not
+"everything that might ever matter"). There is no way to reshape the
+existing room to cover this without breaking what makes it correct for
+its own purpose — this needed a second, genuinely different room, not
+a bigger version of the first one:
+
+- **`/ws/notifications`** — no resource in the path at all, channel
+  `notifications:{user_id}`. No further access check needed beyond the
+  ticket itself: unlike a project a user might not have rights to,
+  there's nothing left to authorize once the ticket's own `user_id`
+  claim is established — the ticket *is* the room.
+- **Lifetime**: opened once at the shell-layout level
+  (`app/(shell)/layout.tsx`), alive across every authenticated page —
+  structurally different from the board room, which lives and dies
+  with one specific page. A browser tab on the board page now holds up
+  to two concurrent connections (its project room plus the always-on
+  notification room); everywhere else in the app, just the one.
+- **A multiplexed alternative was considered and rejected as
+  over-engineering for this slice**: one persistent connection per
+  browser tab that dynamically subscribes/unsubscribes to
+  `project:{id}` as the user navigates, instead of two separate
+  endpoints. That would need real bidirectional message handling (a
+  client-sent "subscribe to project X" command — this app's WebSocket
+  connections have never had any inbound message handling at all) and
+  a way to re-run the project-access check for an *already-accepted*
+  connection asking to add a new subscription mid-flight, not just at
+  handshake time. A real, legitimate future optimization if connection
+  *count* ever actually matters at this app's scale — it doesn't yet —
+  but meaningfully more complex than what two independently-simple
+  rooms already solve correctly today.
+
+**Building the second room is what proved the first one was actually
+general-purpose — not by assertion, by refactor.** `_authenticate_
+handshake` (CSWSH origin check + ticket redemption) and `_run_room`
+(accept, subscribe, the bounded-lifetime dual-task loop, cleanup) are
+now extracted, shared functions in `app/api/ws.py`, used by both
+`project_socket` and the new `notifications_socket`. Writing the
+second room is what revealed the exact boundary between "generic to
+any WS room in this app" and "specific to the board" — the origin
+check, the ticket auth, the 15-minute staleness bound, and the
+per-connection-subscription cleanup guarantee needed zero changes to
+serve a completely different channel shape; only the resource-access
+check (a real DB query for a project, nothing at all for a user's own
+notifications) and the channel name actually varied. If the first
+room's code had needed real surgery to support a second, differently-
+shaped use, that would have been the honest signal that it was
+accidentally coupled to ticket events after all — it didn't, which is
+the actual, demonstrated answer to the question this slice opened
+with.
+
+**Extended the proof-script pattern with `scripts/verify_notifications.py`:**
+both trigger points fire with correct, type-specific payloads;
+assigning to yourself generates no notification; the acting admin
+never receives their own action as a notification; a fully unrelated
+org has zero visibility into another org's activity; mark-read and
+unread-count behave correctly, including a cross-user mark-read
+attempt returning 404 (RLS blocking it, not an app-layer check); and —
+the point 3 payoff — a same-org teammate connected simultaneously to
+the identical project board room never receives the other user's
+notification, while both of them *do* receive the ordinary
+`ticket.updated` broadcast (including the actor's own echo, which is
+by design — self-filtering is a frontend concern, not a server one),
+proving the two channel types coexist on the same infrastructure
+without ever leaking into each other.
+
+**Verified:** all 10 prior proof scripts (including `verify_ws_pubsub`
+against a genuine second process) re-run with no regressions; the new
+`verify_notifications.py` (12 checks) passes; `ruff check .` clean;
+`pip-audit` shows only the same pre-existing `pip`-tool CVEs;
+frontend `ESLint`, `tsc --noEmit`, and a full `next build` clean.
