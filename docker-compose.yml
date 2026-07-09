@@ -25,6 +25,20 @@ services:
       timeout: 5s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "${RABBITMQ_PORT}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build: ./apps/api
     environment:
@@ -40,7 +54,11 @@ services:
       # Container-to-container traffic always uses redis's internal port
       # (6379), not REDIS_PORT (that's only the host-facing mapping).
       REDIS_URL: redis://redis:6379/0
+      # Same internal-port reasoning as REDIS_URL above.
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
     ports:
       - "${API_PORT}:8000"
     volumes:
@@ -49,6 +67,55 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Same image and codebase as api (COPY . . in the Dockerfile already
+  # includes worker/), just a different command — a separate *process*
+  # consuming ticket-triage jobs, not a separate deployable. Doesn't run
+  # entrypoint.sh: only one service should ever run `alembic upgrade head`
+  # at container-start, and api already owns that (two containers racing
+  # to migrate on simultaneous startup is exactly the kind of concurrency
+  # bug worth just not creating in the first place — see worker/main.py
+  # for the deliberate, separate reasoning on job-level concurrency, which
+  # is a different and actually-safe kind of "two processes touching the
+  # same thing at once").
+  worker:
+    build: ./apps/api
+    command: python -m worker.main
+    # Found by actually starting this stack cold, not assumed: rabbitmq's
+    # own healthcheck (rabbitmq-diagnostics ping) can report healthy
+    # slightly before the AMQP listener on 5672 is actually accepting
+    # connections, so the worker's very first connect_robust() attempt can
+    # exhaust its retry budget and raise before RabbitMQ finishes coming
+    # up, crashing the process (aio_pika's own reconnect logic only
+    # covers a connection *dropping after* it was first established, not
+    # an indefinite wait for one to exist yet). Without a restart policy
+    # that's a permanently dead container — Compose does not retry a
+    # crashed one-shot process on its own. on-failure gives it another
+    # attempt once rabbitmq has had a few more seconds, which is all it
+    # actually needs.
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      # Settings() requires these even though the worker never serves HTTP
+      # or builds a shareable link itself — same Settings class as api.
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      FRONTEND_URL: ${FRONTEND_URL}
+    volumes:
+      - ./apps/api:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   web:

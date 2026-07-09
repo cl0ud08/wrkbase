@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     database_url: str
 
     redis_url: str
+    rabbitmq_url: str
+
+    # Empty defaults, not required: this slice doesn't call either LLM yet
+    # (ticket-triage plumbing only — see worker/main.py's hardcoded
+    # placeholder priority), so nothing breaks with these unset. Never
+    # logged, never included in any response — see worker/main.py and
+    # app/services/queue.py for the only places these get read at all.
+    groq_api_key: str = ""
+    gemini_api_key: str = ""
 
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
