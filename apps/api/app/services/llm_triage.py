@@ -1,9 +1,11 @@
 """Real ticket triage: Groq first, Gemini as fallback on any failure. See
 worker/main.py for how a result (or the exhaustion of both providers) gets
-written back to a ticket.
+written back to a ticket, and app/services/llm_client.py for the shared
+Groq/Gemini calling mechanics this module and app/services/ticket_parse.py
+both build on.
 
---- Structured output: why json_object + Pydantic validation, not Groq's
-    own json_schema mode -----------------------------------------------
+--- Structured output: why json_object + Pydantic, not Groq's own
+    json_schema mode -----------------------------------------------
 
 Checked empirically against the real API before choosing, not assumed:
 Groq's `response_format={"type": "json_schema", ...}` (strict,
@@ -33,37 +35,11 @@ confirmed it" are different claims, and only the second one is a claim
 this app is actually able to stand behind.
 """
 
-import asyncio
-import logging
-
-from google import genai
-from google.genai import types as genai_types
-from groq import AsyncGroq
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.config import settings
 from app.db.models import TicketPriority
-
-logger = logging.getLogger("worker.triage.llm")
-
-_GROQ_MODEL = "llama-3.3-70b-versatile"
-_GEMINI_MODEL = "gemini-2.5-flash"
-
-# Don't let a hung provider call hold a worker (and the RabbitMQ message
-# it's processing) indefinitely — see worker/main.py's module docstring
-# on why an unacked message sitting forever is its own kind of problem.
-_CALL_TIMEOUT_SECONDS = 10.0
-
-# Bounds the *total* number of real LLM calls one job can ever cost: at
-# most this many tries against Groq, then at most this many against
-# Gemini, then a terminal failure — never nack-and-requeue back through
-# RabbitMQ on an LLM failure (see worker/main.py), which would restart
-# this same budget from zero on every redelivery and could burn API spend
-# indefinitely on a job that's genuinely never going to succeed.
-_MAX_ATTEMPTS_PER_PROVIDER = 2
-
-_MAX_LABELS = 5
-_MAX_LABEL_LENGTH = 30
+from app.services.llm_client import LLMCallFailed, call_llm
+from app.services.llm_labels import clean_labels
 
 _SYSTEM_PROMPT = """You are a triage assistant for a software engineering issue tracker. Given a ticket's title and description, respond with ONLY a JSON object matching this exact shape — no markdown, no code fences, no text outside the JSON:
 
@@ -83,6 +59,19 @@ labels: 0 to 5 short, lowercase, single-or-hyphenated-word labels (e.g. "bug", "
 
 reasoning: exactly one sentence explaining the priority you chose."""
 
+_GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "priority": {
+            "type": "STRING",
+            "enum": [p.value for p in TicketPriority],
+        },
+        "labels": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "reasoning": {"type": "STRING"},
+    },
+    "required": ["priority", "labels", "reasoning"],
+}
+
 
 class TriageFailed(Exception):
     """Both providers were tried, up to their retry budgets, and neither
@@ -98,19 +87,13 @@ class TriageResult(BaseModel):
 
     @field_validator("labels")
     @classmethod
-    def _clean_labels(cls, value: list[str]) -> list[str]:
+    def _validate_labels(cls, value: list[str]) -> list[str]:
         # Every raw label the model returns is validated here, regardless
         # of which provider produced it (or whether that provider's own
         # structured-output mode was supposed to already guarantee shape)
         # — never trust the model's output blindly, no matter how strong
         # the provider's own guarantee claims to be.
-        cleaned = [label.strip().lower() for label in value if label.strip()]
-        if len(cleaned) > _MAX_LABELS:
-            raise ValueError(f"too many labels ({len(cleaned)} > {_MAX_LABELS})")
-        for label in cleaned:
-            if len(label) > _MAX_LABEL_LENGTH:
-                raise ValueError(f"label {label!r} exceeds {_MAX_LABEL_LENGTH} characters")
-        return cleaned
+        return clean_labels(value)
 
 
 def _user_prompt(title: str, description: str | None) -> str:
@@ -119,84 +102,18 @@ def _user_prompt(title: str, description: str | None) -> str:
     return "\n".join(lines)
 
 
-async def _call_groq(title: str, description: str | None) -> TriageResult:
-    client = AsyncGroq(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
-    response = await asyncio.wait_for(
-        client.chat.completions.create(
-            model=_GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": _user_prompt(title, description)},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-        ),
-        timeout=_CALL_TIMEOUT_SECONDS,
-    )
-    content = response.choices[0].message.content
-    if content is None:
-        raise ValueError("Groq returned an empty completion")
-    return TriageResult.model_validate_json(content)
-
-
-async def _call_gemini(title: str, description: str | None) -> TriageResult:
-    http_options = (
-        genai_types.HttpOptions(base_url=settings.gemini_base_url) if settings.gemini_base_url else None
-    )
-    client = genai.Client(api_key=settings.gemini_api_key, http_options=http_options)
-    response = await asyncio.wait_for(
-        client.aio.models.generate_content(
-            model=_GEMINI_MODEL,
-            contents=_user_prompt(title, description),
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "OBJECT",
-                    "properties": {
-                        "priority": {
-                            "type": "STRING",
-                            "enum": [p.value for p in TicketPriority],
-                        },
-                        "labels": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "reasoning": {"type": "STRING"},
-                    },
-                    "required": ["priority", "labels", "reasoning"],
-                },
-                temperature=0.2,
-            ),
-        ),
-        timeout=_CALL_TIMEOUT_SECONDS,
-    )
-    if not response.text:
-        raise ValueError("Gemini returned an empty response")
-    return TriageResult.model_validate_json(response.text)
-
-
 async def triage_ticket(title: str, description: str | None) -> tuple[TriageResult, str]:
     """Returns (result, provider_name). Raises TriageFailed once both
-    providers have exhausted _MAX_ATTEMPTS_PER_PROVIDER — never retries
-    beyond that budget, and never partially trusts a result that failed
-    TriageResult's validation (a malformed-but-parseable response counts
-    as a failed attempt, exactly like a timeout or a rate limit, not a
-    result written half-validated).
+    providers have exhausted their attempt budget (see
+    app/services/llm_client.py) — never retries beyond that, and never
+    partially trusts a result that failed TriageResult's validation.
     """
-    for provider_name, call in (("groq", _call_groq), ("gemini", _call_gemini)):
-        for attempt in range(1, _MAX_ATTEMPTS_PER_PROVIDER + 1):
-            try:
-                result = await call(title, description)
-            except Exception as exc:
-                logger.warning(
-                    "%s triage attempt %d/%d failed: %s: %s",
-                    provider_name,
-                    attempt,
-                    _MAX_ATTEMPTS_PER_PROVIDER,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            return result, provider_name
-
-    raise TriageFailed(
-        f"both providers exhausted their {_MAX_ATTEMPTS_PER_PROVIDER}-attempt budget"
-    )
+    try:
+        return await call_llm(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=_user_prompt(title, description),
+            response_model=TriageResult,
+            gemini_schema=_GEMINI_SCHEMA,
+        )
+    except LLMCallFailed as exc:
+        raise TriageFailed(str(exc)) from exc

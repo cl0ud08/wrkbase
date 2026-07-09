@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -19,9 +20,17 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
+from app.schemas.ticket_parse import TicketParseRequest
 from app.services.notifications import create_notification, publish_notification
 from app.services.queue import TriageJob, publish_triage_job
 from app.services.ticket_events import publish_ticket_update
+from app.services.ticket_parse import (
+    ParsedTicketCandidate,
+    TicketParseUnavailable,
+    parse_ticket_text,
+)
+
+logger = logging.getLogger("api.tickets")
 
 router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
 
@@ -298,6 +307,69 @@ async def create_ticket(
     )
 
     return ticket
+
+
+# Synchronous, not published to RabbitMQ like the triage job above: a user
+# is actively looking at this request, waiting to review whatever comes
+# back, before deciding to create anything. Triage is async because it
+# runs *after* ticket creation has already succeeded and returned to the
+# caller -- there's no one waiting on its result to decide their next
+# action, so paying its latency inline on every ticket creation would be
+# pure cost with no user-facing benefit (that's exactly why the "AI
+# triaging…" pending-state UI pattern exists at all). Parsing is the
+# opposite: the entire point of calling this endpoint is to get the
+# result back and show it, so the HTTP response *is* the useful output,
+# not a mere acknowledgment a background job will later supersede. A
+# background-job version of this endpoint would need its own polling or
+# WebSocket-delivery mechanism for a single one-off request the caller is
+# already sitting on a connection for -- real added complexity bought for
+# zero benefit, given parse latency (a single bounded LLM call, ~1-3s) is
+# well within normal HTTP request tolerance.
+#
+# Deliberately does NOT create a ticket. Returns a candidate for the
+# caller to review/edit; actual creation goes through the exact same
+# POST above (the caller submits the reviewed/edited title/description/
+# type through the normal TicketCreate body) -- see this router's own
+# create_ticket for why that composition doesn't need a separate
+# "already parsed" code path: TicketCreate already accepts exactly the
+# fields a confirmed candidate has (type/title/description), and
+# create_ticket already doesn't care whether a human typed those directly
+# into a form or edited them from an AI suggestion first. priority/labels
+# are intentionally never threaded through to creation, even though the
+# candidate includes them: every created ticket still gets async-triaged
+# exactly as today (see create_ticket above), which is the actual source
+# of truth for priority/labels on every ticket, parsed-origin or not --
+# passing the parse's preview values through would just be silently
+# overwritten moments later, so there's nothing to gain and a stale-looking
+# UI moment to lose by pretending they're authoritative here.
+@router.post("/parse", response_model=ParsedTicketCandidate)
+async def parse_ticket(
+    project_id: uuid.UUID,
+    payload: TicketParseRequest,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> ParsedTicketCandidate:
+    await _get_project_or_404(db, project_id)
+
+    try:
+        candidate, provider = await parse_ticket_text(payload.text)
+    except TicketParseUnavailable as exc:
+        # A real provider/infrastructure failure -- both Groq and Gemini
+        # were tried and exhausted their budgets -- not "the AI looked at
+        # this and wasn't confident" (that's confident=False below, a
+        # normal 200). Nothing was created either way; a 503 tells the
+        # frontend this is worth retrying or falling back to the plain
+        # manual form, not treating the input itself as the problem.
+        logger.error("ticket parse unavailable for project=%s: %s", project_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Couldn't reach the AI parsing service right now. Try again, or fill in the ticket form manually.",
+        ) from exc
+
+    logger.info(
+        "parsed ticket text for project=%s via=%s confident=%s", project_id, provider, candidate.confident
+    )
+    return candidate
 
 
 @router.get("", response_model=list[TicketRead])
