@@ -67,6 +67,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://wrkbase_app:wrkbase_app_ci_password@localhost:5432/wrkbase
       ADMIN_DATABASE_URL: postgresql+asyncpg://wrkbase:wrkbase_ci_password@localhost:5432/wrkbase
       REDIS_URL: redis://localhost:6379/0
+      RABBITMQ_URL: amqp://wrkbase:wrkbase_mq_ci_password@localhost:5672/
       JWT_SECRET_KEY: ci-test-secret-do-not-use-outside-ci
       CORS_ORIGINS: http://localhost:3000
     services:
@@ -89,6 +90,18 @@ jobs:
           - 6379:6379
         options: >-
           --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: wrkbase
+          RABBITMQ_DEFAULT_PASS: wrkbase_mq_ci_password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics ping"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
@@ -289,6 +302,45 @@ jobs:
       # project board channel even for the exact same mutating request.
       - name: Verify notifications
         run: python -m scripts.verify_notifications
+
+      - name: Reset rate limiter (ticket triage)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Two, not one: verify_triage.py's competing-consumers check needs a
+      # second real worker process actually competing for the same queue
+      # to mean anything — one worker processing everything correctly
+      # would look identical whether or not double-processing is possible.
+      # Logs redirected to a file and polled instead of a port/health
+      # endpoint (a queue consumer has neither) — found locally that
+      # rabbitmq's own healthcheck can report healthy slightly before the
+      # AMQP listener actually accepts connections, so connect_robust's
+      # first attempt can fail; by the time this step runs (well after
+      # the services block's own health gate), rabbitmq has had many
+      # other steps' worth of time to finish starting, which is the real
+      # fix — this loop is the fail-clearly backstop, not the fix itself.
+      - name: Start two worker processes for the triage proof
+        run: |
+          python -m worker.main > /tmp/worker1.log 2>&1 &
+          python -m worker.main > /tmp/worker2.log 2>&1 &
+          for i in $(seq 1 30); do
+            grep -q "worker started" /tmp/worker1.log 2>/dev/null && \
+              grep -q "worker started" /tmp/worker2.log 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "Workers did not start in time" >&2
+          cat /tmp/worker1.log /tmp/worker2.log >&2
+          exit 1
+
+      # Phase 3 slice 1: pending_triage on creation, the worker's async
+      # transition, the live update over the board's existing WebSocket
+      # room, tenant isolation for the async path (including a direct
+      # RLS-defense-in-depth check that a job claiming the wrong org_id is
+      # rejected and touches nothing), an unacked message surviving a
+      # simulated worker crash (redelivered, not lost — confirmed via
+      # RabbitMQ's own redelivered flag), and multiple competing workers
+      # never double-processing the same job.
+      - name: Verify ticket triage
+        run: python -m scripts.verify_triage
 
       - name: Run pytest suite (if any test files exist yet)
         run: |
