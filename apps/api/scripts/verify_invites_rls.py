@@ -128,6 +128,19 @@ async def main() -> None:
         assert dup_resp.status_code == 409, f"expected 409, got {dup_resp.status_code}"
         print("PASS: inviting an email that's already a registered user is rejected (409)")
 
+        # --- inviting the same email twice while a pending invite already ---
+        # exists is rejected too, not silently allowed to pile up -- a real
+        # bug caught in actual use: nothing stopped this before, so the
+        # same email could accumulate any number of simultaneously-valid,
+        # independently-redeemable invite tokens with no indication in the
+        # list view beyond eyeballing which rows share an email.
+        pending_dup_email = f"pending-dup-{suffix}@example.dev"
+        first_pending = await create_invite(client, token_a, pending_dup_email, role="member")
+        first_pending.raise_for_status()
+        second_pending = await create_invite(client, token_a, pending_dup_email, role="admin")
+        assert second_pending.status_code == 409, f"expected 409, got {second_pending.status_code}"
+        print("PASS: inviting an email with an already-pending invite is rejected (409), not duplicated")
+
         # --- non-admin cannot create invites or change roles ----------------
         member_invite_email = f"member-b-{suffix}@example.dev"
         member_invite_resp = await create_invite(client, token_b, member_invite_email, role="member")
@@ -228,6 +241,67 @@ async def main() -> None:
         emails_a = {m["email"] for m in members_a.json()}
         assert emails_a == {f"admin-a-{suffix}@example.dev", invitee_email}
         print("PASS: GET /org/members only lists org A's own members")
+
+        # --- regenerate: old token dies, new one works, same shape as ---------
+        # password-reset's resend-invalidates-old-token behavior.
+        regen_email = f"regen-{suffix}@example.dev"
+        original = await create_invite(client, token_a, regen_email, role="member")
+        original.raise_for_status()
+        original = original.json()
+
+        regen_resp = await client.post(
+            f"/invites/{original['id']}/regenerate", headers=auth_headers(token_a)
+        )
+        regen_resp.raise_for_status()
+        regenerated = regen_resp.json()
+        assert regenerated["id"] != original["id"], "regenerate should replace the row, not edit it in place"
+        assert regenerated["token"] != original["token"]
+        assert regenerated["email"] == regen_email and regenerated["role"] == "member"
+        print("PASS: regenerating an invite returns a fresh id + token, same email/role")
+
+        old_token_preview = await client.get(
+            "/invites/preview", params={"token": original["token"]}
+        )
+        assert old_token_preview.status_code == 400, (
+            f"expected the pre-regenerate token to stop resolving, got {old_token_preview.status_code}"
+        )
+        print("PASS: the original link stops working the instant regeneration succeeds")
+
+        new_token_preview = await client.get(
+            "/invites/preview", params={"token": regenerated["token"]}
+        )
+        new_token_preview.raise_for_status()
+        assert new_token_preview.json()["email"] == regen_email
+        regen_join = await signup(client, regen_email, invite_token=regenerated["token"])
+        regen_join.raise_for_status()
+        assert (await me(client, regen_join.json()["access_token"]))["org_id"] == org_a_id
+        print("PASS: the regenerated link resolves and is genuinely redeemable end to end")
+
+        # --- cross-org: org B cannot regenerate org A's invite ----------------
+        cross_org_invite = await create_invite(client, token_a, f"cross-regen-{suffix}@example.dev")
+        cross_org_invite.raise_for_status()
+        cross_org_regen = await client.post(
+            f"/invites/{cross_org_invite.json()['id']}/regenerate", headers=auth_headers(token_b)
+        )
+        assert cross_org_regen.status_code == 404, f"expected 404, got {cross_org_regen.status_code}"
+        print("PASS: org B directly regenerating org A's invite id -> 404")
+
+        # --- regenerating an already-accepted invite is rejected --------------
+        accepted_regen = await client.post(
+            f"/invites/{original['id']}/regenerate", headers=auth_headers(token_a)
+        )
+        # original['id'] no longer exists at all (deleted by its own
+        # regeneration above) -- 404, the same outcome as "doesn't exist,"
+        # is correct here too. The distinct "already accepted" 400 is
+        # covered by regenerating the invite regen_join just redeemed.
+        assert accepted_regen.status_code == 404, f"expected 404, got {accepted_regen.status_code}"
+        already_accepted_regen = await client.post(
+            f"/invites/{regenerated['id']}/regenerate", headers=auth_headers(token_a)
+        )
+        assert already_accepted_regen.status_code == 400, (
+            f"expected 400, got {already_accepted_regen.status_code}"
+        )
+        print("PASS: regenerating an already-accepted invite is rejected (400), not silently reissued")
 
     print("\nAll invite + member-management checks passed.")
 

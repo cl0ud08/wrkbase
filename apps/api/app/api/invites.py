@@ -52,6 +52,34 @@ async def create_invite(
             status_code=status.HTTP_409_CONFLICT, detail="This email is already registered"
         )
 
+    # A real gap, not a hypothetical: nothing above (or anywhere else in
+    # this function, before this check was added) stopped an admin from
+    # inviting the same email two, three, any number of times, each
+    # creating its own independently-valid Invite row with its own token —
+    # every one of them redeemable, all coexisting, with no indication in
+    # the list view that they're duplicates of each other beyond eyeballing
+    # the email column. RLS already scopes this query to auth.org_id, same
+    # as every other query in this file — no explicit org_id filter needed.
+    # Scoped to accepted_at IS NULL AND not yet expired, deliberately, not
+    # "any invite ever sent to this email": an accepted invite means
+    # they're already a member (and would have hit the UserLookup check
+    # above already, since that email is now registered), and an expired,
+    # never-accepted one is inert — creating a fresh invite when the only
+    # match is a dead one is exactly what regenerate_invite already does
+    # for an explicit existing row, so there's nothing to protect here.
+    pending = await db.execute(
+        select(Invite).where(
+            Invite.email == payload.email,
+            Invite.accepted_at.is_(None),
+            Invite.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    if pending.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An invite is already pending for this email — revoke or regenerate it instead",
+        )
+
     # Opaque random token (secrets.token_urlsafe), not a JWT — deliberately
     # the same choice already made for refresh tokens (app/core/security.py).
     # A JWT would let anyone holding it decode org_id/email/role without a
@@ -79,6 +107,67 @@ async def create_invite(
 
     link = f"{settings.frontend_url}/signup?invite={token}"
     return InviteCreateResponse(**InviteRead.model_validate(invite).model_dump(), token=token, link=link)
+
+
+@router.post("/{invite_id}/regenerate", response_model=InviteCreateResponse, status_code=status.HTTP_201_CREATED)
+async def regenerate_invite(
+    invite_id: uuid.UUID,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> InviteCreateResponse:
+    # For the same real gap this fixes: an admin who didn't copy the link
+    # the moment POST /invites returned it has no way to see it again —
+    # InviteRead deliberately omits token from every GET (see its
+    # docstring), the same "shown once" treatment as a password-reset or
+    # email-verification link, not an oversight. This is the "revoke and
+    # recreate" the InviteRead docstring already prescribes for that case,
+    # as its own endpoint: reused for tenant-scoped RLS access the same
+    # way sprints.py's /start and /complete are their own endpoints
+    # instead of overloaded PATCH semantics, and so the frontend can act
+    # on a specific already-listed invite row without re-supplying
+    # email/role from scratch.
+    _require_admin(auth)
+    result = await db.execute(select(Invite).where(Invite.id == invite_id))
+    invite = result.scalar_one_or_none()
+    if invite is None:
+        raise _NOT_FOUND
+    if invite.accepted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invite has already been accepted; nothing to regenerate",
+        )
+
+    # Delete-then-recreate, not an in-place token update on the same row:
+    # invite_lookup is kept in sync by an AFTER INSERT trigger only
+    # (migration 0007) — there's no AFTER UPDATE counterpart. Updating
+    # this row's token column directly would leave invite_lookup's row
+    # still pointing the OLD token at this invite (whose contents just
+    # changed under it) and create no entry at all for the new token —
+    # both preview_invite and auth.py's _redeem_invite resolve a token
+    # exclusively through invite_lookup, so the old link would keep
+    # resolving and the new one would never work. Deleting cascades the
+    # stale invite_lookup row away (its FK is ondelete=CASCADE); adding a
+    # fresh Invite row fires the trigger again for the new token.
+    email, role, invited_by = invite.email, invite.role, invite.invited_by
+    await db.delete(invite)
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.invite_expire_days)
+    new_invite = Invite(
+        org_id=auth.org_id,
+        email=email,
+        role=role,
+        invited_by=invited_by,
+        token=token,
+        expires_at=expires_at,
+    )
+    db.add(new_invite)
+    await db.commit()
+
+    link = f"{settings.frontend_url}/signup?invite={token}"
+    return InviteCreateResponse(
+        **InviteRead.model_validate(new_invite).model_dump(), token=token, link=link
+    )
 
 
 @router.get("", response_model=list[InviteRead])
