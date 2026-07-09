@@ -237,6 +237,18 @@ jobs:
       - name: Verify invites + member management
         run: python -m scripts.verify_invites_rls
 
+      - name: Reset rate limiter (websocket handshake)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 2 slice 1: the WebSocket handshake itself, not pub/sub (that
+      # doesn't exist yet). Four ways in are proven rejected at the
+      # handshake -- no ticket, an invalid ticket, a mismatched Origin
+      # (CSWSH), and a valid ticket for a project the caller's org can't
+      # reach -- plus a reused ticket (replay) and the real happy path,
+      # which also has to survive a short idle period and close cleanly.
+      - name: Verify WebSocket handshake auth
+        run: python -m scripts.verify_ws
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
