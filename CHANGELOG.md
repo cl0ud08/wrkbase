@@ -2505,3 +2505,215 @@ passes with two real competing worker processes running; `ruff check .`
 clean; `pip-audit` shows only the same pre-existing `pip`-tool CVEs,
 nothing new from `aio-pika`; frontend `ESLint`, `tsc --noEmit`, and a
 full `next build` clean.
+
+---
+
+## Slice 27 — Phase 3, slice 2: a real LLM in the triage worker, and a
+cross-slice regression it exposed in an unrelated proof script
+
+**Built:** `app/services/llm_triage.py`, replacing Slice 26's
+hardcoded placeholder with a real call to Groq (primary) and Gemini
+(fallback), plus the schema and worker changes to write and display
+its output for real.
+
+**Structured output: `json_object` mode + Pydantic, not Groq's own
+`json_schema` mode — checked empirically, not assumed.** Groq's
+strict, schema-enforced `response_format={"type": "json_schema", ...}`
+was tried first, since it's the stronger guarantee. It returned a real
+400: `"This model does not support response format json_schema"` for
+`llama-3.3-70b-versatile` — that mode is real, but only on a subset of
+Groq's models, and the fast, cost-effective one this slice actually
+wants isn't one of them. `{"type": "json_object"}` (loose JSON
+mode — guarantees syntactically valid JSON, not schema conformance)
+works fine on this model, confirmed the same way. So the exact shape
+(`priority`, `labels`, `reasoning`) is spelled out in the system
+prompt instead, and every response — from either provider — is parsed
+through a `TriageResult` Pydantic model regardless of which mode
+produced it. Gemini's `response_schema` (real, SDK-enforced structured
+output) was also checked, not assumed, and does work as documented —
+worth noting `gemini-2.0-flash` returned a 429 with this key's free-tier
+quota for that specific model reported as a literal `0`, a real,
+current constraint discovered by trying it, not a hypothetical;
+`gemini-2.5-flash` works. Gemini's stronger guarantee doesn't earn it a
+pass through validation either — "the SDK enforced it" and "this app
+independently confirmed it" are different claims, and `TriageResult`
+is what makes the second claim true for both providers alike. Labels
+get stripped, lowercased, and capped (5 labels, 30 characters each) in
+`TriageResult`'s own validator; a response that parses as JSON but
+fails these checks is treated exactly like a timeout or a rate limit —
+a failed attempt, not a half-trusted write.
+
+**`priority` moved from a free string to a real `TicketPriority` enum,
+and `pending_triage` moved from Slice 26's nullable-timestamp idiom to
+a real `triage_status` enum (`pending`/`triaged`/`failed`).** Slice 26
+picked the nullable-timestamp idiom deliberately, but flagged its own
+limit at the time: it only has two states. This slice adds a genuine
+third one — an LLM call can now fail in a way that isn't "hasn't run
+yet" — so the idiom stops fitting and a real enum column
+(migration 0018) replaces it. `labels` is a native Postgres
+`ARRAY(String)`, not `jsonb` or a join table: it's a handful of
+free-text, no-independent-identity strings per ticket, which is the
+exact shape a Postgres array is for. `jsonb` would be unused
+flexibility for data that's already flat; a join table (`Label` +
+`TicketLabel`) is the right shape only if labels become an org-wide
+managed taxonomy with their own identity, filtering, and rename
+semantics — not what's being built here.
+
+**Groq-then-Gemini fallback, with a hard budget, not an unbounded
+retry loop.** `triage_ticket()` tries Groq up to
+`_MAX_ATTEMPTS_PER_PROVIDER` (2) times, then Gemini up to the same
+budget, logging which provider actually served the result — genuinely
+useful for debugging, and proven to actually fire, not just wired:
+`verify_triage_llm.py` deliberately breaks `_call_groq` for one real
+call and confirms the real Gemini API serves a valid result in its
+place. Each individual provider call is wrapped in
+`asyncio.wait_for(..., timeout=10.0)` — an unbounded hung LLM call
+would otherwise hold both the worker and the RabbitMQ message it's
+processing indefinitely, the same class of problem Slice 26's
+prefetch/ack reasoning already exists to prevent, just from a new
+source. If both providers exhaust their budget, `triage_ticket()`
+raises `TriageFailed` — a real, terminal outcome, not a silent drop.
+
+**A caught `TriageFailed` is ack'd, not nack'd-and-requeued — the
+worker's ack/nack design extended, not reused unchanged.** Slice 26's
+ack/nack policy was built for *infrastructure* failures (a DB write or
+Redis publish failing mid-job), where `nack(requeue=True)` is correct:
+retry the whole job, infrastructure recovers. An LLM failure is a
+different kind of failure — a handled business outcome, not a
+transient one. `worker/main.py` catches `TriageFailed` specifically,
+writes `triage_status="failed"` plus `triage_error` to the real ticket
+row, publishes that over the board's existing WebSocket room so a
+`pending_triage` ticket never sits invisible forever, commits, and
+*returns normally* — letting the outer loop ack the message. Letting a
+`TriageFailed` fall through to the generic
+`except Exception: nack(requeue=True)` handler instead would restart
+the full retry budget from zero on every redelivery, silently burning
+API spend on a job that's never going to succeed. This is the concrete
+answer to "what happens if both providers fail": a real, visible,
+terminal ticket state, not an infinite loop or a swallowed error.
+
+**Frontend:** the board's `TriageIndicator` now shows the real
+`priority` (color-coded badge) and `labels` once triage completes, a
+`triage_reasoning` tooltip so a human can see *why* the AI picked a
+given priority, and a distinct red "Triage failed" state (with the
+real error as its tooltip) instead of the old binary
+triaged/not-triaged badge — over the same live-update WebSocket
+mechanism Slice 26 already built, unchanged.
+
+**CI's proof script hits a local stub, not the real APIs — a
+deliberate, explicit departure from this project's real-infrastructure
+testing precedent, not a default applied without thought.** Every
+other proof script in this repo — RLS, auth, Redis pub/sub, and
+Slice 26's own RabbitMQ/worker proof — deliberately runs against real
+Postgres, real Redis, real RabbitMQ in CI, on the standing principle
+that mocking the thing you're trying to prove works defeats the
+purpose. A real LLM API call doesn't fit that principle the same way,
+for reasons specific to it and not to the others: Postgres, Redis, and
+RabbitMQ in CI are free, fully self-controlled, and deterministic —
+spinning one up costs nothing and produces the same result every run.
+A real Groq or Gemini call costs real money on every single push to a
+public repo, is genuinely non-deterministic even at low temperature
+(the same ticket can legitimately classify differently run to run),
+and depends on a third party's uptime and rate limits, none of which
+this project controls. Mocking `triage_ticket()` itself at the Python
+level was rejected too — that would stop exercising the real Groq/
+Gemini SDKs' own request construction and response parsing, which is
+exactly the code most likely to break silently (a header format
+change, a response shape change). The middle path:
+`scripts/_fake_llm_server.py`, a minimal local FastAPI server speaking
+just enough of each provider's real wire shape (`choices[0].message
+.content` for Groq, `candidates[0].content.parts[0].text` for Gemini)
+to satisfy the real, unmodified SDK clients' own response parsing —
+verified by pointing the actual `AsyncGroq`/`genai.Client` code at it
+via `base_url` override, a plain, SDK-native config knob both clients
+already support, not a special mock-mode branch grafted onto
+production code. CI's `verify_triage.py` run now exercises 100% of
+this app's own code (queue consume, prompt build, real HTTP call
+through the real SDKs, response parsing, `TriageResult` validation, DB
+write, Redis publish) with only the literal network hop swapped for a
+deterministic, free, instant one. The real integration — actual model
+behavior, actual latency, an actual fallback firing against Gemini's
+live API — is what `scripts/verify_triage_llm.py` exists for
+separately: not wired into CI, run manually/locally, and explicit in
+its own docstring about why (real API credits, real non-determinism,
+exactly the two properties CI's own run needed to avoid).
+
+**A real bug caught locally before it could break CI: an empty API
+key produces an illegal HTTP header, not a clean auth failure.**
+Building the CI wiring for the stub server surfaced this: pointing
+`AsyncGroq`/`genai.Client` at *any* base URL with an empty
+`api_key=""` — which is `Settings`'s own default — produces
+`httpx.LocalProtocolError: Illegal header value b'Bearer '`, raised by
+httpx itself before the request ever leaves the process, because a
+trailing-whitespace-only header value is invalid per the HTTP spec.
+Against the stub server this would have looked identical to "the stub
+server is broken," not "the key is unset" — a confusing failure mode
+to debug from CI logs alone. Fixed by giving CI job-level
+`GROQ_API_KEY`/`GEMINI_API_KEY` deliberately fake but *non-empty*
+values (`ci-stub-groq-key` / `ci-stub-gemini-key`) — the stub server
+never checks them, so any non-empty string works, but non-empty is
+what keeps the header well-formed.
+
+**The cross-slice regression: `verify_ws_pubsub.py` (Phase 2, predates
+this slice) started failing, with nothing in its own code touched.**
+Running the full regression suite after wiring the stub into CI
+surfaced a real failure in `verify_ws_pubsub.py`'s "a mutation on a
+different project is never received" check — an `AssertionError` on a
+message tab1 wasn't expecting at all. The actual mechanism: that
+script creates two fixture tickets as normal test setup (one per
+project) the same way it always has, but as of this slice, *every*
+ticket creation now also enqueues an async triage job that eventually
+publishes its own `ticket.updated` event to that ticket's board-room
+channel — a side effect that didn't exist when `verify_ws_pubsub.py`
+was written and has nothing to do with the mutation the script is
+actually trying to test. tab1 only ever subscribes to its own
+project's channel (confirmed via the very `PUBSUB NUMSUB` check
+earlier in the same script), so the stray message it received could
+only have been that project's own ticket's belated triage-completion
+event, landing squarely inside the 1.5-second "expect nothing" window
+by pure timing. This is the exact same race class Slice 26's own
+`verify_triage.py` had already hit once (a ticket's completion racing
+ahead of a not-yet-connected WebSocket subscriber) — just newly
+surfaced in a second, older script that had no reason to think about
+async triage when it was written, because at the time it was written,
+tickets didn't have any async side effect at all. **Fixed by reusing
+`verify_triage.py`'s own technique**: added a `wait_until_triaged`
+helper and drained both fixture tickets' triage jobs immediately after
+creating them, before any WebSocket connection opens — removing the
+race by construction instead of widening the timeout and hoping.
+Re-run clean afterward, including the cross-process fan-out check
+this script exists for in the first place.
+
+**Audited the other two ticket-creating proof scripts for the same
+exposure, rather than assuming the fix belonged in exactly one
+place.** `verify_notifications.py` creates a ticket as a fixture too
+and has its own "expect no message" check — but on a *structurally
+different* channel (`notifications:{user_id}`, not `project:{id}`)
+that a triage completion never publishes to, so that specific check
+was never at risk. Its later board-room checks (asserting a
+`ticket.updated` event arrives and isn't a `notification.created`)
+could theoretically still race with a stray triage completion, but
+even under that race the assertions would keep passing — a triage
+completion *is* a `ticket.updated` event on the same channel, so the
+check's literal conditions hold regardless of which specific
+`ticket.updated` event arrives first. Left as-is: fixing a race that
+can't produce a false failure would be effort spent proving a point
+the test doesn't need proven. `verify_ws.py` was the easy case — it
+never creates a ticket at all (it only exercises the WebSocket
+handshake itself), so it was never exposed to begin with. Checking all
+three rather than patching the one that happened to fail is the same
+standard this project already holds itself to for RLS gaps and ack/nack
+races: a bug's *class*, not just its one observed instance, is what
+needs to be ruled out.
+
+**Verified:** all 12 backend proof scripts pass, including the fixed
+`verify_ws_pubsub.py` and the CI-representative local dry run of the
+new stub-server wiring (stub server + two stub-pointed worker
+processes, matching CI's exact env-var setup); `verify_triage_llm.py`
+passes against the real Groq and Gemini APIs (outage ticket →
+high/critical, cosmetic ticket → low/medium, a real Gemini fallback
+firing with Groq deliberately broken, both-broken raising
+`TriageFailed`); `ruff check .` clean; `pip-audit` clean, including the
+two new dependencies (`groq`, `google-genai`); frontend `npm audit`
+(only the same pre-existing, already-tracked moderate `postcss`
+finding), `ESLint`, `tsc --noEmit`, and a full `next build` all clean.

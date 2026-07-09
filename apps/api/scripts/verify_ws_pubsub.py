@@ -73,6 +73,33 @@ async def get_ws_ticket(client: httpx.AsyncClient, token: str) -> str:
     return resp.json()["ticket"]
 
 
+async def get_ticket(client: httpx.AsyncClient, token: str, project_id: str, ticket_id: str) -> dict:
+    resp = await client.get(f"/projects/{project_id}/tickets/{ticket_id}", headers=auth_headers(token))
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def wait_until_triaged(
+    client: httpx.AsyncClient, token: str, project_id: str, ticket_id: str, timeout: float = 15
+) -> None:
+    # Every ticket created below is also, as of Phase 3 slice 2, a trigger
+    # for an async worker job that eventually publishes its own
+    # ticket.updated event to this exact ticket's project channel -- the
+    # same channel this script's "expect no message" checks listen on.
+    # Undrained, that job can complete at any point after creation and
+    # land in the middle of a later timing-sensitive assertion here,
+    # exactly like the race verify_triage.py's own proof hit and fixed.
+    # Draining both fixture tickets up front, before any WS connection
+    # opens, removes the race instead of chasing it via a longer timeout.
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        t = await get_ticket(client, token, project_id, ticket_id)
+        if t["triage_status"] != "pending":
+            return
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"ticket {ticket_id} was not triaged within {timeout}s")
+
+
 async def move_ticket(
     client: httpx.AsyncClient, token: str, project_id: str, ticket_id: str, workflow_state_id: str
 ) -> None:
@@ -108,6 +135,12 @@ async def main() -> None:
 
         ticket = await create_ticket(client, token, project["id"], "Move me")
         other_ticket = await create_ticket(client, token, other_project["id"], "Should never be seen")
+
+        # Drain both tickets' async triage jobs now, before any WS
+        # connection exists to receive their completion events -- see
+        # wait_until_triaged's docstring for why this has to happen here.
+        await wait_until_triaged(client, token, project["id"], ticket["id"])
+        await wait_until_triaged(client, token, other_project["id"], other_ticket["id"])
 
         ws_ticket_1 = await get_ws_ticket(client, token)
         ws_ticket_2 = await get_ws_ticket(client, token)
