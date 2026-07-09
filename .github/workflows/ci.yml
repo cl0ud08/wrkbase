@@ -70,6 +70,23 @@ jobs:
       RABBITMQ_URL: amqp://wrkbase:wrkbase_mq_ci_password@localhost:5672/
       JWT_SECRET_KEY: ci-test-secret-do-not-use-outside-ci
       CORS_ORIGINS: http://localhost:3000
+      # Deliberately fake, non-secret values -- the worker processes below
+      # never reach a real provider in CI. Non-empty on purpose: an empty
+      # api_key produces a malformed `Authorization: Bearer ` header that
+      # httpx itself rejects before the request ever leaves the box (hit
+      # this for real while testing locally against an unset key), and
+      # that failure would look identical to "the stub server is broken"
+      # in these logs. GROQ_BASE_URL/GEMINI_BASE_URL point both SDKs at
+      # the local stub started below instead of the real providers -- see
+      # scripts/_fake_llm_server.py and verify_triage.py's module
+      # docstring for why a CI-wired proof runs against a stub here
+      # instead of hitting real, billed, non-deterministic LLM APIs on
+      # every push (verify_triage_llm.py, run manually/locally, is what
+      # actually exercises the real Groq/Gemini integration).
+      GROQ_API_KEY: ci-stub-groq-key
+      GEMINI_API_KEY: ci-stub-gemini-key
+      GROQ_BASE_URL: http://localhost:9100
+      GEMINI_BASE_URL: http://localhost:9100
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -305,6 +322,24 @@ jobs:
 
       - name: Reset rate limiter (ticket triage)
         run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Speaks just enough of Groq's and Gemini's real wire shape to
+      # satisfy their official SDKs' own response parsing, so the workers
+      # started below run their real code path (queue consume, prompt
+      # build, HTTP call via the real SDKs, response parsing, Pydantic
+      # validation, DB write, Redis publish) without this job costing API
+      # credits or being at the mercy of a live model's non-determinism on
+      # every single push. See scripts/_fake_llm_server.py's own docstring.
+      - name: Start fake LLM stub server
+        run: |
+          python -m scripts._fake_llm_server 9100 > /tmp/fake_llm.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9100/health && exit 0
+            sleep 1
+          done
+          echo "Fake LLM stub server did not become healthy in time" >&2
+          cat /tmp/fake_llm.log >&2
+          exit 1
 
       # Two, not one: verify_triage.py's competing-consumers check needs a
       # second real worker process actually competing for the same queue

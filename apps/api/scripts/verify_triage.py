@@ -13,10 +13,62 @@ to construct deliberately adversarial messages the real API would never
 publish — the same "raw internals, not just black-box HTTP" precedent
 verify_rls.py already established for RLS mechanics this specific.
 
-Needs a second worker process running alongside the one every real
-deployment has, for the competing-consumers check:
+--- Why this script runs against a local stub, not the real Groq/Gemini
+    APIs, even though this project has consistently preferred real
+    infrastructure over mocks everywhere else -------------------------
 
-    docker compose exec api python -m worker.main &   (a second one)
+Every other "real infra" proof in this project (Postgres RLS, Redis
+pub/sub across genuinely separate processes, RabbitMQ ack/nack against
+the real broker) shares three properties that a real LLM call does not:
+it's free (already-paid-for compute, not a metered third-party API),
+deterministic (the same test against the same infra produces the same
+result every time), and fully under this project's own control (spun up
+fresh, in CI, with throwaway credentials meaningless outside that one
+run). A real Groq/Gemini call breaks all three at once: it costs real
+money on every push (this repo gets pushed to often — a portfolio
+project's commit cadence, not a low-traffic production service), it's
+inherently non-deterministic (the same "classify this ticket" prompt can
+reasonably return a different priority today than tomorrow, even at low
+temperature, independent of whether this app's code is correct), and it
+depends on a third party's uptime and rate limits, which are outside
+this project's control (a transient 429 or a personal free-tier quota
+already used up locally would fail this exact check for a reason that
+has nothing to do with whether the plumbing works). None of that is true
+of Postgres/Redis/RabbitMQ in CI, which is exactly why real infra was
+the right call for those and isn't the right call for this specific
+external dependency. A flaky CI gate that fails for reasons unrelated to
+code correctness is worse than no gate at all in that one dimension —
+and every check in this file already existed as a deterministic,
+reliable proof of the *plumbing* before an LLM was ever in the loop
+(Slice 1's hardcoded placeholder); making it flaky now, for a dimension
+(triage quality) this file was never testing in the first place, would
+be a straight regression, not a tradeoff.
+
+The fix is not `unittest.mock.patch`-ing this app's own triage_ticket()
+function, though — that would stop exercising the real code (prompt
+construction, the real Groq/Gemini SDK calls, the real JSON parsing,
+the real Pydantic validation) this slice actually needs proven. Instead:
+scripts/_fake_llm_server.py is a tiny local server speaking just enough
+of each provider's real wire shape to satisfy the official SDKs' own
+response parsing, and GROQ_BASE_URL/GEMINI_BASE_URL — a completely
+ordinary, SDK-native config knob, not a special test-mode branch grafted
+onto worker/main.py or llm_triage.py — point the real worker process at
+it instead of the real providers. Every line of this app's own code
+still runs for real; only the literal network hop to a paid third party
+is swapped for a free, instant, deterministic stand-in.
+
+A second, NOT CI-wired script, scripts/verify_triage_llm.py, exists
+specifically to hit the real APIs — run manually, locally, when someone
+actually wants to confirm the real integration still works, not on
+every push.
+
+Needs a second worker process running alongside the one every real
+deployment has, for the competing-consumers check, both pointed at the
+fake LLM server:
+
+    docker compose exec api python -m scripts._fake_llm_server &
+    GROQ_BASE_URL=http://localhost:9100 GEMINI_BASE_URL=http://localhost:9100 \\
+        docker compose exec api python -m worker.main &   (x2)
     docker compose exec api python -m scripts.verify_triage
 """
 
@@ -87,7 +139,7 @@ async def wait_until_triaged(
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         t = await get_ticket(client, token, project_id, ticket_id)
-        if t["triaged_at"] is not None:
+        if t["triage_status"] != "pending":
             return t
         await asyncio.sleep(0.5)
     raise AssertionError(f"ticket {ticket_id} was not triaged within {timeout}s")
@@ -121,11 +173,29 @@ async def main() -> None:
         # does mean this test has to connect first, same as a real client
         # would (the board page always connects before anyone can act).
         ticket_a = await create_ticket(client, token_a, project_a["id"], "Triage me")
+        assert ticket_a["triage_status"] == "pending"
         assert ticket_a["priority"] is None
+        assert ticket_a["labels"] is None
         assert ticket_a["triaged_at"] is None
-        print("PASS: a freshly created ticket is pending_triage (both fields null) immediately, synchronously")
+        print("PASS: a freshly created ticket is pending_triage immediately, synchronously")
 
-        # --- the worker correctly transitions it, live update included ------
+        # Drained (waited out) before moving on, not left in flight: the
+        # fake LLM server responds fast enough that this job can still be
+        # unprocessed by the time the next check opens its own WebSocket
+        # connection, and RabbitMQ delivers this queue's messages in the
+        # order they were published — an unrelated still-pending job from
+        # this check would race the next one's own ticket for "first
+        # message received." Waiting for it here (and re-checking its
+        # final shape) removes that race instead of hoping it doesn't fire.
+        triaged = await wait_until_triaged(client, token_a, project_a["id"], ticket_a["id"])
+        assert triaged["triage_status"] == "triaged"
+        assert triaged["priority"] in ("low", "medium", "high", "critical")
+        assert isinstance(triaged["labels"], list)
+        assert triaged["triage_reasoning"]
+        assert triaged["triage_error"] is None
+        print("PASS: the worker transitions a pending ticket to triaged with real priority/labels/reasoning set")
+
+        # --- the live update itself, over the board's existing WebSocket ----
         ws_ticket_a = await get_ws_ticket(client, token_a)
         uri_a = f"{WS_URL}/ws/projects/{project_a['id']}?ticket={ws_ticket_a}"
         async with websockets.connect(uri_a, origin=VALID_ORIGIN) as ws_a:
@@ -135,13 +205,12 @@ async def main() -> None:
             live_data = json.loads(live_msg)
             assert live_data["type"] == "ticket.updated"
             assert live_data["ticket_id"] == ticket_a2["id"]
-            assert live_data["changes"]["priority"] == "medium"
+            assert live_data["changes"]["triage_status"] == "triaged"
+            assert live_data["changes"]["priority"] in ("low", "medium", "high", "critical")
+            assert isinstance(live_data["changes"]["labels"], list)
+            assert live_data["changes"]["triage_reasoning"]
             assert live_data["updated_by"] == "00000000-0000-0000-0000-000000000000"
             print("PASS: the triage completion is pushed live over the board's existing WebSocket room")
-
-        triaged = await wait_until_triaged(client, token_a, project_a["id"], ticket_a["id"])
-        assert triaged["priority"] == "medium"
-        print("PASS: the worker transitions a pending ticket to triaged with a real priority set")
 
         # --- tenant isolation for the async path: org B never sees it -------
         ws_ticket_b = await get_ws_ticket(client, token_b)
@@ -186,6 +255,7 @@ async def main() -> None:
             )
         await asyncio.sleep(3)  # let the real worker pick this up and reject it
         after = await get_ticket(client, token_a, project_a["id"], ticket_a["id"])
+        assert after["triage_status"] == before["triage_status"]
         assert after["priority"] == before["priority"]
         assert after["triaged_at"] == before["triaged_at"]
         print(
@@ -252,7 +322,7 @@ async def main() -> None:
                 except asyncio.TimeoutError:
                     break
                 data = json.loads(msg)
-                if data.get("type") == "ticket.updated" and "priority" in data.get("changes", {}):
+                if data.get("type") == "ticket.updated" and "triage_status" in data.get("changes", {}):
                     seen_triage_events.append(data["ticket_id"])
 
         assert len(seen_triage_events) == batch_count, (
