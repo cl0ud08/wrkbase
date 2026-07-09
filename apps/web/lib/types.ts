@@ -157,6 +157,51 @@ export function mapTicketPage(data: TicketPageApiResponse): TicketPage {
   };
 }
 
+// Returned by POST .../tickets/parse (apps/api/app/services/ticket_parse.py)
+// -- never persisted, never a Ticket. confident=true guarantees title and
+// type are both present; confident=false guarantees clarification is
+// present instead and means the frontend should NOT pre-fill a review
+// form from the other fields, even if some are non-null — the model may
+// have offered partial guesses, but nothing here treats them as reliable
+// (see ticket_parse.py's own docstring for why). priority/labels are a
+// preview only: confirming a candidate submits just type/title/description
+// through the normal create-ticket endpoint, which still runs real async
+// triage afterward — that, not this preview, is what actually ends up on
+// the created ticket.
+export interface ParsedTicketCandidate {
+  confident: boolean;
+  title: string | null;
+  description: string | null;
+  type: TicketType | null;
+  priority: TicketPriority | null;
+  labels: string[];
+  clarification: string | null;
+}
+
+interface ParsedTicketCandidateApiResponse {
+  confident: boolean;
+  title: string | null;
+  description: string | null;
+  type: TicketType | null;
+  priority: TicketPriority | null;
+  labels: string[];
+  clarification: string | null;
+}
+
+export function mapParsedTicketCandidate(
+  data: ParsedTicketCandidateApiResponse,
+): ParsedTicketCandidate {
+  return {
+    confident: data.confident,
+    title: data.title,
+    description: data.description,
+    type: data.type,
+    priority: data.priority,
+    labels: data.labels,
+    clarification: data.clarification,
+  };
+}
+
 // Pushed over the project WebSocket (see apps/api/app/services/ticket_events.py)
 // whenever a collaborative field changes — a deliberately minimal diff, not
 // a full Ticket, so a connected client can splice it into local state

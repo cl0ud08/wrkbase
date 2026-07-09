@@ -18,10 +18,12 @@ import { apiFetch } from "../../../../lib/api";
 import { useAuth } from "../../../../lib/auth-context";
 import {
   mapMember,
+  mapParsedTicketCandidate,
   mapTicket,
   mapTicketUpdatedEvent,
   mapWorkflowState,
   type Member,
+  type ParsedTicketCandidate,
   type Ticket,
   type TicketPriority,
   type TicketType,
@@ -117,6 +119,209 @@ function TriageIndicator({ ticket }: { ticket: Ticket }) {
           {label}
         </span>
       ))}
+    </div>
+  );
+}
+
+// Types a parsed candidate can ever carry (see ticket_parse.py's own
+// prompt) — deliberately excludes "subtask", which needs a specific
+// parent ticket that free text alone can't determine.
+const PARSE_TYPE_OPTIONS: Exclude<TicketType, "subtask">[] = ["epic", "story", "task"];
+
+// Natural-language ticket creation: parse, then review/edit, then confirm
+// — never auto-submits on parse, same "don't auto-create silently"
+// principle as everywhere else AI touches this app. Self-contained: owns
+// its own text/candidate/edit state so ProjectBoardPage only needs to
+// know when it's done (onCreated) or dismissed (onCancel).
+function ParseTicketPanel({
+  projectId,
+  onCreated,
+  onCancel,
+}: {
+  projectId: string;
+  onCreated: () => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [parsing, setParsing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [candidate, setCandidate] = useState<ParsedTicketCandidate | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editType, setEditType] = useState<Exclude<TicketType, "subtask">>("task");
+
+  async function handleParse(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setCandidate(null);
+    setParsing(true);
+
+    const res = await apiFetch(`/api/projects/${projectId}/tickets/parse`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+
+    if (res.ok) {
+      const parsed = mapParsedTicketCandidate(await res.json());
+      setCandidate(parsed);
+      if (parsed.confident) {
+        setEditTitle(parsed.title ?? "");
+        setEditDescription(parsed.description ?? "");
+        setEditType((parsed.type as Exclude<TicketType, "subtask">) ?? "task");
+      }
+    } else {
+      const data = await res.json().catch(() => null);
+      setError(data?.detail ?? "Couldn't parse that. Try again, or fill in the ticket manually.");
+    }
+    setParsing(false);
+  }
+
+  async function handleConfirm(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setConfirming(true);
+
+    // The exact same creation endpoint every other ticket goes through —
+    // no "already parsed" flag. It doesn't care whether editTitle came
+    // from a form or an edited AI suggestion, and it still queues the
+    // usual async triage job, which is what actually determines this
+    // ticket's real priority/labels, not the preview above.
+    const res = await apiFetch(`/api/projects/${projectId}/tickets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: editType, title: editTitle, description: editDescription || null }),
+    });
+
+    if (res.ok) {
+      await onCreated();
+    } else {
+      const data = await res.json().catch(() => null);
+      setError(data?.detail ?? "Failed to create ticket.");
+    }
+    setConfirming(false);
+  }
+
+  return (
+    <div className="flex w-full max-w-md flex-col gap-2.5 rounded-lg border border-line bg-surface p-3">
+      {!candidate && (
+        <form onSubmit={handleParse} className="flex flex-col gap-2.5">
+          <textarea
+            className="min-h-[64px] rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
+            placeholder="Describe your ticket… e.g. “create a bug for login failing on Safari, high priority”"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            required
+          />
+          {error && <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>}
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={parsing}
+              className="self-start rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
+            >
+              {parsing ? "Parsing…" : "Parse"}
+            </button>
+            <button
+              type="button"
+              onClick={onCancel}
+              className="self-start rounded-md px-3 py-1.5 text-sm font-medium text-ink-secondary hover:text-ink"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+
+      {candidate && !candidate.confident && (
+        <div className="flex flex-col gap-2.5">
+          <p className="rounded-md bg-warning-bg px-3 py-2 text-sm text-warning">
+            Not sure what to make of that: {candidate.clarification}
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setCandidate(null)}
+              className="self-start rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink hover:bg-hover"
+            >
+              Try rephrasing
+            </button>
+            <button
+              onClick={() => {
+                // Honest fallback, not a fabricated guess: hand the raw
+                // text over as a starting point for the title rather than
+                // pretending the AI extracted one.
+                setEditTitle(text);
+                setEditDescription("");
+                setEditType("task");
+                setCandidate({ ...candidate, confident: true });
+              }}
+              className="self-start rounded-md px-3 py-1.5 text-sm font-medium text-ink-secondary hover:text-ink"
+            >
+              Fill in manually
+            </button>
+          </div>
+        </div>
+      )}
+
+      {candidate && candidate.confident && (
+        <form onSubmit={handleConfirm} className="flex flex-col gap-2.5">
+          <input
+            className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
+            placeholder="Ticket title"
+            value={editTitle}
+            onChange={(e) => setEditTitle(e.target.value)}
+            required
+          />
+          <textarea
+            className="min-h-[56px] rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
+            placeholder="Description (optional)"
+            value={editDescription}
+            onChange={(e) => setEditDescription(e.target.value)}
+          />
+          <select
+            value={editType}
+            onChange={(e) => setEditType(e.target.value as Exclude<TicketType, "subtask">)}
+            className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink"
+          >
+            {PARSE_TYPE_OPTIONS.map((t) => (
+              <option key={t} value={t}>
+                {t[0].toUpperCase() + t.slice(1)}
+              </option>
+            ))}
+          </select>
+
+          {(candidate.priority || candidate.labels.length > 0) && (
+            <div className="flex flex-wrap items-center gap-1 text-[11px] text-ink-tertiary">
+              <span>AI preview (finalized after creation):</span>
+              {candidate.priority && <PriorityBadge priority={candidate.priority} />}
+              {candidate.labels.map((label) => (
+                <span key={label} className="rounded-sm bg-hover px-1.5 py-0.5 font-mono">
+                  {label}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {error && <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>}
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={confirming}
+              className="self-start rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
+            >
+              {confirming ? "Creating…" : "Create ticket"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setCandidate(null)}
+              className="self-start rounded-md px-3 py-1.5 text-sm font-medium text-ink-secondary hover:text-ink"
+            >
+              Back
+            </button>
+          </div>
+        </form>
+      )}
     </div>
   );
 }
@@ -277,7 +482,7 @@ export default function ProjectBoardPage() {
   const [states, setStates] = useState<WorkflowState[] | null>(null);
   const [tickets, setTickets] = useState<Ticket[] | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
-  const [showForm, setShowForm] = useState(false);
+  const [activeForm, setActiveForm] = useState<"quick" | "describe" | null>(null);
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -372,7 +577,7 @@ export default function ProjectBoardPage() {
 
     if (res.ok) {
       setTitle("");
-      setShowForm(false);
+      setActiveForm(null);
       await load();
     } else {
       const data = await res.json().catch(() => null);
@@ -484,15 +689,21 @@ export default function ProjectBoardPage() {
             Workflow settings
           </a>
           <button
-            onClick={() => setShowForm((v) => !v)}
+            onClick={() => setActiveForm((v) => (v === "describe" ? null : "describe"))}
+            className="rounded-md border border-line px-3 py-1.5 text-sm font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover"
+          >
+            {activeForm === "describe" ? "Cancel" : "Describe with AI"}
+          </button>
+          <button
+            onClick={() => setActiveForm((v) => (v === "quick" ? null : "quick"))}
             className="rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
           >
-            {showForm ? "Cancel" : "New ticket"}
+            {activeForm === "quick" ? "Cancel" : "New ticket"}
           </button>
         </div>
       </div>
 
-      {showForm && (
+      {activeForm === "quick" && (
         <form
           onSubmit={handleCreate}
           className="flex w-full max-w-md flex-col gap-2.5 rounded-lg border border-line bg-surface p-3"
@@ -517,7 +728,18 @@ export default function ProjectBoardPage() {
         </form>
       )}
 
-      {error && !showForm && (
+      {activeForm === "describe" && (
+        <ParseTicketPanel
+          projectId={projectId}
+          onCreated={async () => {
+            setActiveForm(null);
+            await load();
+          }}
+          onCancel={() => setActiveForm(null)}
+        />
+      )}
+
+      {error && activeForm === null && (
         <p className="w-fit rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
       )}
 
@@ -533,12 +755,20 @@ export default function ProjectBoardPage() {
             Create one to get started — it&apos;ll land in{" "}
             {states.find((s) => s.isDefault)?.name ?? "the first column"}.
           </p>
-          <button
-            onClick={() => setShowForm(true)}
-            className="mt-1 rounded-md bg-accent px-3.5 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
-          >
-            New ticket
-          </button>
+          <div className="mt-1 flex gap-2">
+            <button
+              onClick={() => setActiveForm("describe")}
+              className="rounded-md border border-line px-3.5 py-1.5 text-sm font-medium text-ink hover:border-line-strong hover:bg-hover"
+            >
+              Describe with AI
+            </button>
+            <button
+              onClick={() => setActiveForm("quick")}
+              className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover"
+            >
+              New ticket
+            </button>
+          </div>
         </div>
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={handleDragEnd}>

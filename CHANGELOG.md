@@ -2749,3 +2749,161 @@ firing with Groq deliberately broken, both-broken raising
 two new dependencies (`groq`, `google-genai`); frontend `npm audit`
 (only the same pre-existing, already-tracked moderate `postcss`
 finding), `ESLint`, `tsc --noEmit`, and a full `next build` all clean.
+
+---
+
+## Slice 28 — Phase 3, slice 3: natural-language ticket creation, reusing
+the triage slice's LLM plumbing instead of a second parallel path
+
+**Built:** `POST /projects/{id}/tickets/parse` — takes raw text ("create
+a bug for login failing on Safari, high priority"), asks Groq (Gemini on
+fallback) to extract a candidate title/description/type/priority/labels,
+and returns it for review. Creates nothing by itself. A user reviews
+and edits the candidate, then confirms through the exact same
+`POST /projects/{id}/tickets` every other ticket already goes through —
+no second creation endpoint, no "already parsed" flag.
+
+**Synchronous, not published to RabbitMQ — the deciding question is
+"is there a caller actively waiting on this result," not "does it call
+an LLM."** Triage (Slice 27) is async because it runs *after* ticket
+creation has already succeeded and returned to the caller — nobody is
+blocked on its result, so paying LLM latency inline on every creation
+would be pure cost with no user-facing benefit, which is exactly why
+the "AI triaging…" pending-state UI exists at all. Parsing inverts
+that: the entire reason to call this endpoint is to get the result back
+and show it to the user before anything is created. There's no
+"successful action" to acknowledge early and finish in the background —
+the HTTP response *is* the useful output. A background-job version
+would need its own polling or WebSocket-delivery mechanism for a single
+one-off request the caller is already sitting on a connection for: real
+added complexity bought for zero benefit, given parse latency (one
+bounded LLM call, ~1-3s) is well within normal HTTP tolerance. Both
+calls hit the same providers for the same kind of reason (structured
+extraction from text) — what differs is only ever *who's waiting and
+for what*, not the LLM plumbing underneath, which is why extracting
+that plumbing into a shared module (next) made sense while the
+sync/async split around it didn't need to.
+
+**`app/services/llm_client.py` (new): the Groq-primary/Gemini-fallback
+mechanics extracted out of `llm_triage.py`, once ticket parsing became
+a second real call site needing the identical behavior** — timeout per
+call, a bounded retry budget per provider, provider fallback order,
+and validating the raw response through a caller-supplied Pydantic
+model before trusting it. Two real call sites is what justified this
+now; a single one, or a hypothetical future one, wouldn't have — this
+project's own standing rule against building abstractions ahead of
+actual need, applied to its own LLM code instead of just app features.
+`llm_triage.py`'s public API (`TriageFailed`, `TriageResult`,
+`triage_ticket`) is byte-for-byte unchanged — `worker/main.py` needed
+zero edits, since `triage_ticket()` now just catches the shared
+module's generic `LLMCallFailed` and re-raises it as the same
+`TriageFailed` callers have always caught. `ticket_parse.py` gets its
+own `TicketParseUnavailable` for the same reason: each call site keeps
+a domain-specific failure name for its own callers to catch, even
+though both are raised from the one shared `LLMCallFailed` underneath.
+Label-list validation (strip/lowercase/cap count/length) moved to
+`app/services/llm_labels.py` too — `TriageResult` and the new
+`ParsedTicketCandidate` both ask a model for "a few short, lowercase,
+free-text labels" and both need to distrust it identically, so that
+rule lives once.
+
+**`ParsedTicketCandidate.confident` is a first-class field the model
+sets, and a second, independent gate this app enforces on top of it —
+never trusting the model's own claim about itself any more than its
+factual output.** The system prompt instructs the model to set
+`confident: false` and explain why in `clarification` rather than
+fabricate a title or type it isn't sure about — the model is asked to
+be honest. But asking isn't the same as trusting: a `model_validator`
+on `ParsedTicketCandidate` independently re-checks the shape that
+`confident` value actually implies. `confident=true` requires both
+`title` and `type` to genuinely be present, and rejects `type=subtask`
+outright (a subtask needs a specific parent ticket that free text alone
+can never supply — the prompt asks the model to avoid it too, but this
+is the actual enforcement, not the request). `confident=false` requires
+`clarification` to actually be present, not empty. A response that
+claims `confident=true` but is missing `title` fails this validator and
+counts as a failed attempt in `call_llm`'s retry loop — exactly like a
+timeout, a malformed JSON body, or a rate limit — never a half-trusted
+result written through because the model's own flag said it was fine.
+Confirmed empirically against both real providers, not assumed: a clear
+input ("create a bug for login failing on Safari, high priority")
+returns `confident: true` with a real title/type from both Groq and a
+forced Gemini fallback; a deliberately ambiguous one ("asdf lol
+whatever") returns `confident: false` with a real, specific
+`clarification` from both — including Gemini's `response_schema`
+correctly handling every field as nullable, not just the previously-
+proven all-required shape from triage.
+
+**Two failure classes, two different HTTP responses, on purpose.**
+Both providers exhausting their attempt budgets (`TicketParseUnavailable`)
+is a real infrastructure/provider failure — nothing about the input is
+the problem, Groq and Gemini were just unreachable or kept erroring.
+That's a 503: *"couldn't reach the AI parsing service right now, try
+again, or fill in manually."* `confident=false` is the opposite: the
+service worked perfectly and gave an honest, correct answer — "I looked
+at this and can't confidently tell." That's a 200, because it isn't an
+error at all; collapsing it into a 5xx would tell the frontend (and a
+future reader of this code) that something broke when nothing did.
+Conflating these two into one generic "parse failed" response would
+have thrown away the one distinction that actually matters to a user
+deciding what to do next: retry the exact same request (infra hiccup)
+versus rephrase or just fill in the form (their input genuinely wasn't
+clear enough).
+
+**Frontend: review step lets you edit title/description/type — what
+actually gets submitted — but shows `priority`/`labels` as a read-only
+"AI preview," not editable form fields, even though the candidate
+carries both.** Every created ticket still gets async-triaged exactly
+as before (Slice 27), regardless of whether it came from this flow or
+the plain form — confirmed directly rather than assumed (see the last
+proof-script check below), and that async result is the actual source
+of truth for a ticket's real priority/labels, not this preview.
+Editing the preview values would therefore be inert: whatever a user
+typed into those fields would never be sent anywhere (`TicketCreate`
+still only accepts `type`/`title`/`description`, unchanged since
+Slice 1) and would be silently overwritten the moment triage completes
+regardless. Offering editable fields that quietly do nothing is worse
+than not offering them — the read-only preview, captioned "finalized
+after creation," tells the truth about what's actually about to happen
+instead of implying a control that isn't real. A low-confidence
+response never pre-fills the review form at all — its own fields aren't
+promised reliable even when partially present (see the model's own
+docstring) — and offers "try rephrasing" or "fill in manually" (seeded
+with the user's own raw text as a starting title, not a fabricated
+guess) instead.
+
+**Extended the proof-script pattern with `scripts/verify_ticket_parse.py`**
+against the same local LLM stub as `verify_triage.py`, for the same
+reasoning (free, deterministic, exercises every real line of this app's
+own code). `scripts/_fake_llm_server.py` became content-aware to serve
+this: it reads the same prompt text a real model would read and
+distinguishes a triage request from a parse request by each one's own
+system-prompt wording, and a confident parse from a low-confidence one
+via a plainly-named sentinel (`stub_trigger_low_confidence`) the proof
+script puts in its own deliberately-ambiguous test input — visible in
+both places, not a hidden test-only hook. Covers: a confident parse
+creates nothing by itself (ticket count unchanged before/after); a
+low-confidence parse is honestly reported, never fabricates a title or
+type, and also creates nothing; tenant isolation on the new endpoint
+specifically (org B parsing under org A's project id → 404), not
+assumed just because it reuses `create_ticket`'s own project-lookup
+helper; and — the composition Slice 3's own brief asked to have
+confirmed, not assumed — confirming a parsed-and-edited candidate
+through the normal creation endpoint still starts the ticket
+`pending_triage` and still reaches `triaged` via the real worker
+exactly like any other ticket.
+
+**Verified:** all 12 backend proof scripts pass, including the new
+`verify_ticket_parse.py`, re-run against the CI-representative local
+stub setup (stub server + two stub-pointed workers + a stub-pointed API
+process, matching CI's job-level env exactly); the parse prompt
+confirmed empirically against the real Groq and Gemini APIs for both
+the confident and low-confidence cases, and a real Gemini fallback with
+Groq deliberately broken; `ruff check .` clean; `pip-audit` clean;
+frontend `ESLint`, `tsc --noEmit`, and a full `next build` all clean.
+No browser-level UI verification this slice — no browser automation
+tool was available in this environment, so the frontend flow was
+verified by exercising the exact same HTTP endpoints the UI calls
+(`verify_ticket_parse.py`) plus clean lint/typecheck/build, stated
+here plainly rather than implied as equivalent to having actually
+clicked through it.
