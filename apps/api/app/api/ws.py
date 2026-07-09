@@ -1,8 +1,8 @@
-"""Phase 2, slice 1: an authenticated WebSocket connection, proven secure.
-No pub/sub and no message handling yet — this only proves the handshake
-itself can't be hijacked, spoofed, or used to reach a project the caller
-doesn't have access to, and that the connection's own trust doesn't quietly
-outlive the same 15-minute bound every other credential in this app has.
+"""Phase 2: an authenticated WebSocket connection, proven secure (slice 1),
+now forwarding live board events from Redis pub/sub to every connection
+subscribed to a project's room (slice 2). The handshake's own protections
+(CSWSH origin check, ticket auth, project-access check, bounded connection
+lifetime) are unchanged from slice 1 — see their inline comments below.
 """
 
 import asyncio
@@ -13,8 +13,10 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.core.redis import redis_client
 from app.db.models import Project
 from app.db.session import AsyncSessionLocal, set_tenant_context
+from app.services.ticket_events import project_channel
 from app.services.ws_tickets import redeem_ws_ticket
 
 router = APIRouter()
@@ -138,22 +140,85 @@ async def project_socket(websocket: WebSocket, project_id: uuid.UUID) -> None:
     # be between refreshes.
     await websocket.accept()
 
+    # --- 5. Subscribe to this project's room ---------------------------------
+    # One Redis pub/sub connection per WebSocket connection, not one shared
+    # subscription fanning out to many local listeners: two people with the
+    # same project open still means two independent `.subscribe()` calls
+    # against Redis. That's slightly more Redis-side connections than a
+    # single shared-subscription-plus-in-process-demux design would use, but
+    # it means there is no per-connection routing logic in this process that
+    # a bug could get wrong — Redis itself is what fans one published
+    # message out to every subscriber of a channel, which is exactly the
+    # "leak across independently-authenticated sessions" risk requirement 2
+    # asks about: there's no shared, mutable dispatch table here for a leak
+    # to live in. Revisit if connection *count* ever becomes the actual
+    # bottleneck — it is not, at this app's real scale.
+    #
+    # The channel name is keyed on project_id alone — the same project_id
+    # already confirmed, above, to belong to this connection's own org via a
+    # real RLS-scoped query. A connection to project A's channel structurally
+    # cannot receive project B's events: nothing publishes to project A's
+    # channel except a mutation that already passed project A's own
+    # tenant-scoped lookup in tickets.py. There's no additional filtering
+    # step here that could be gotten wrong, because there's nothing to
+    # filter — subscribing to the right channel *is* the isolation.
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe(project_channel(project_id))
+
     deadline = time.monotonic() + settings.access_token_expire_minutes * 60
-    try:
+
+    async def _client_loop() -> None:
+        # Detects disconnect and (once this app has real inbound messages to
+        # handle) would read them — no message handling yet, so inbound
+        # frames are simply discarded. Runs concurrently with _redis_loop
+        # below: reading and writing a WebSocket are independent ASGI
+        # channels, so a slow or silent client doesn't block message
+        # delivery, and vice versa.
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                await websocket.close(
-                    code=status.WS_1000_NORMAL_CLOSURE, reason="Session expired — reconnect"
-                )
-                return
-            try:
-                message = await asyncio.wait_for(websocket.receive(), timeout=remaining)
-            except asyncio.TimeoutError:
-                continue  # loop back; remaining will now be <= 0
+            message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 return
-            # No message handling yet (this slice's deliberate scope) —
-            # any inbound frame is simply ignored.
+
+    async def _redis_loop() -> None:
+        # pubsub.listen() also yields the subscribe confirmation itself
+        # (type "subscribe", not "message") — skipped, not forwarded, since
+        # a client has no use for its own subscription's bookkeeping.
+        # decode_responses=True on redis_client means message["data"] is
+        # already the exact JSON string ticket_events.publish_ticket_update
+        # produced; relayed as-is, no re-encoding needed on this side.
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            await websocket.send_text(message["data"])
+
+    try:
+        client_task = asyncio.create_task(_client_loop())
+        redis_task = asyncio.create_task(_redis_loop())
+        expiry_task = asyncio.create_task(asyncio.sleep(max(deadline - time.monotonic(), 0)))
+
+        done, pending = await asyncio.wait(
+            {client_task, redis_task, expiry_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        for task in done:
+            if task is not expiry_task and task.exception() is not None:
+                raise task.exception()  # surface a real bug instead of swallowing it
+
+        if expiry_task in done:
+            await websocket.close(
+                code=status.WS_1000_NORMAL_CLOSURE, reason="Session expired — reconnect"
+            )
     except WebSocketDisconnect:
-        return
+        pass
+    finally:
+        # Cleanly unsubscribed and closed on every exit path — normal
+        # disconnect, expiry, or an unhandled error above — not just the
+        # happy path. A pubsub object that's merely dropped (relying on GC)
+        # would leave Redis still tracking this connection as a live
+        # subscriber indefinitely; requirement 6's proof script checks this
+        # via PUBSUB NUMSUB, not just trusts it.
+        await pubsub.unsubscribe(project_channel(project_id))
+        await pubsub.aclose()
