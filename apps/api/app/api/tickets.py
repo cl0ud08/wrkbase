@@ -20,6 +20,7 @@ from app.db.models import (
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
 from app.services.notifications import create_notification, publish_notification
+from app.services.queue import TriageJob, publish_triage_job
 from app.services.ticket_events import publish_ticket_update
 
 router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
@@ -279,9 +280,23 @@ async def create_ticket(
         story_points=payload.story_points,
         ticket_number=ticket_number,
         created_by=auth.user_id,
+        # priority/triaged_at start NULL (pending_triage) simply by being
+        # omitted here — nothing synchronous happens with them at creation
+        # time at all; see the publish below.
     )
     db.add(ticket)
     await db.commit()
+
+    # Fire-and-forget: the response below returns immediately with the
+    # ticket still pending_triage, not blocked on anything — see
+    # worker/main.py for the consumer that actually sets priority/
+    # triaged_at, asynchronously, and publishes the live update itself.
+    await publish_triage_job(
+        TriageJob(
+            ticket_id=ticket.id, org_id=auth.org_id, title=ticket.title, description=ticket.description
+        )
+    )
+
     return ticket
 
 

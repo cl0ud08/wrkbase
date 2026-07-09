@@ -1,7 +1,18 @@
 import json
 import uuid
+from datetime import datetime
 
 from app.core.redis import redis_client
+
+# A sentinel, not a real user — the nil UUID can never collide with a real
+# gen_random_uuid()-generated id, and is a well-known convention for
+# exactly this "no actual actor" case. Used by worker/main.py: a
+# worker-initiated change (e.g. finishing triage) has no originating human
+# user whose own tab should suppress the echo the way a real user's
+# updated_by does (see the board page's onmessage handler) — every
+# connected client, including the ticket's own creator, should see it
+# applied, since none of them caused it optimistically.
+SYSTEM_ACTOR_ID = uuid.UUID(int=0)
 
 
 # One function builds the channel name for both sides (tickets.py publishes
@@ -13,7 +24,11 @@ def project_channel(project_id: uuid.UUID) -> str:
 
 
 def _json_safe(value: object) -> object:
-    return str(value) if isinstance(value, uuid.UUID) else value
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 async def publish_ticket_update(
