@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import CopyableLink from "../../components/CopyableLink";
+
 interface PasswordResetRequestResponse {
   message: string;
   // Dev-mode-only stand-in for real email delivery (out of scope) — see
@@ -78,18 +80,25 @@ export default function ForgotPasswordPage() {
       {result && (
         <div className="flex w-full max-w-sm flex-col gap-3 rounded-lg border border-line bg-surface p-6 shadow-[var(--shadow-elevated)]">
           <p className="text-sm text-ink">{result.message}</p>
-          <div className="rounded-md border border-accent bg-accent-subtle p-3 text-sm">
+          <div className="flex flex-col gap-2 rounded-md border border-accent bg-accent-subtle p-3 text-sm">
             <p className="text-accent-subtle-text">
               Dev mode: email sending isn&apos;t wired up yet, so here&apos;s the link directly. This
               would never appear in a real response — it would only be emailed to the address above.
             </p>
-            <a
-              href={result.reset_link}
-              className="mt-1 block truncate font-mono text-xs text-ink underline decoration-dotted"
-            >
-              {result.reset_link}
-            </a>
+            <CopyableLink link={result.reset_link} />
           </div>
+          {/* Requesting again invalidates nothing on its own (each reset
+              token is independently valid until used or expired — see
+              request_password_reset), but the form was unreachable once
+              `result` was set, with no way back except a full reload. This
+              just gets back to it. */}
+          <button
+            type="button"
+            onClick={() => setResult(null)}
+            className="text-xs font-medium text-ink-tertiary hover:text-accent"
+          >
+            Send another link
+          </button>
         </div>
       )}
 

@@ -2067,3 +2067,105 @@ genuine two-process setup, in CI and locally; `ruff check .` clean;
 `pip-audit` shows only the same pre-existing `pip`-tool CVEs, unrelated
 to this slice; frontend `ESLint`, `tsc --noEmit`, and a full
 `next build` all clean.
+
+---
+
+## Slice 24 — Invite link retrieval, copy-to-clipboard, and a real
+duplicate-invite bug found along the way
+
+**Built:** `POST /invites/{invite_id}/regenerate` — revoke-and-reissue
+for a pending invite whose link wasn't copied in time; a shared
+`CopyableLink` component (Clipboard API with a "Copied!" confirmation,
+falling back to select-to-copy when the API is unavailable) used
+everywhere a one-time link is shown — the Team page's invite reveal,
+`forgot-password`'s reset link, and `VerificationBanner`'s resend
+link — plus a way back to each of those forms once a link has been
+shown, which didn't exist before (the form was simply gone once
+`result`/`state` was set).
+
+**Point 1 first: is the invite token safe to just re-display, or was
+it designed like a password reset link?** Checked, not assumed:
+`Invite.token` (`app/db/models.py`) is stored as plain text, unhashed
+— technically retrievable. But `InviteRead`'s own docstring already
+answers the design question: it's deliberately excluded from every
+`GET /invites` response, "if an admin needs to reshare, revoke and
+recreate" — the same treatment as a password-reset link, by design,
+not an oversight. That sentence is what `regenerate_invite` is.
+
+**Why regenerate is delete-then-recreate, not an in-place token
+update — checked migration 0007, not assumed.** `invite_lookup` is
+kept in sync by an `AFTER INSERT` trigger only; there's no `AFTER
+UPDATE` counterpart. Updating the existing row's `token` column
+directly would leave `invite_lookup` still pointing the *old* token at
+this invite (now holding different contents) and create no entry at
+all for the new one — both `preview_invite` and `_redeem_invite`
+resolve a token exclusively through `invite_lookup`, so the old link
+would keep resolving and the new one would never work. Deleting
+cascades the stale `invite_lookup` row away (`ondelete=CASCADE`);
+inserting a fresh `Invite` row fires the trigger again for the new
+token. A new endpoint rather than reusing `POST /invites`: it acts on
+a specific already-listed invite id without resupplying email/role,
+and matches this app's existing sub-action convention (`/start`,
+`/complete`, `/restore` elsewhere) instead of overloading create
+semantics.
+
+**The real bug, found by actually using the feature: `create_invite`
+never checked for an existing pending invite, only an existing
+*user*.** The `UserLookup` check already in place stopped inviting
+someone already registered; nothing stopped inviting the same,
+not-yet-registered email twice, three times, any number of times —
+each click created its own independently-valid `Invite` row with its
+own token, all simultaneously redeemable, with nothing in the Team
+page's list distinguishing them beyond eyeballing which rows share an
+email. Worse than just clutter: redeeming any *one* of the duplicates
+does nothing to the others (`_redeem_invite` only touches the row it's
+given — checked directly, not assumed), so they'd sit there showing
+"pending" forever even after the person had already joined via a
+different link. Fixed with a check next to the existing one: a
+pending (`accepted_at IS NULL`, not yet expired) invite for that email
+in the same org now returns `409` pointing at Revoke/Regenerate
+instead of silently piling up. An *expired*, never-accepted invite
+doesn't block a new one — that row is already inert, and creating a
+fresh invite when the only match is a dead one is exactly what
+`regenerate_invite` already does deliberately for an explicit row.
+
+**Reconfirmed, not just carried forward: does this change anything
+about password-reset's multiple-valid-tokens design?** Checked
+directly against the two things that actually made invite duplication
+a real bug, not against a vague "duplicates are bad" instinct:
+
+1. *Is there a list-management surface where duplicates become
+   visually confusing?* Invites have one — the Team page's pending-
+   invite list, which an admin actively reads to track who still needs
+   onboarding. Password-reset tokens have no equivalent: no endpoint
+   lists a user's outstanding reset tokens anywhere, to anyone. There
+   is nothing for a duplicate to visibly clutter.
+2. *Does redeeming one duplicate clean up the others, or do they linger
+   forever?* Invites: lingered forever, confirmed above — the actual
+   mechanism that turned "harmless coexistence" into a real bug.
+   Password reset: the opposite, and already built — `confirm_password
+   _reset` (Slice 18) explicitly invalidates every other outstanding
+   token for that user the moment any one of them is used successfully.
+   Losing track of an old reset link, then requesting a new one, then
+   using the new one, silently cleans up the old one as a side effect;
+   losing track of an old invite link never did.
+
+Both conditions that made the invite bug real are specifically absent
+for password reset. The original reasoning stands — this is a
+different situation, not a smaller version of the same one — and nothing
+here changes it.
+
+**Extended `verify_invites_rls.py`** with 6 new checks: regenerating
+returns a fresh id + token (never the same row edited in place); the
+*original* link stops resolving the instant regeneration succeeds; the
+new link resolves and is genuinely redeemable end to end, not merely
+previewable; cross-org regenerate attempts 404; regenerating an
+already-accepted invite is rejected (400); and — the bug fix itself —
+inviting an email with an already-pending invite is rejected (409)
+instead of creating a second, indistinguishable, independently-valid
+row.
+
+**Verified:** all 21 checks in `verify_invites_rls.py` pass (first run,
+no fixups needed); `verify_auth_rls` and `verify_projects_rls` re-run
+as an adjacency check with no regressions; `ruff check .` clean;
+frontend `ESLint` and `tsc --noEmit` clean; a full `next build` clean.

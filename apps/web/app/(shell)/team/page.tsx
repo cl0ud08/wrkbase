@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import CopyableLink from "../../../components/CopyableLink";
 import { apiFetch } from "../../../lib/api";
 import { useAuth } from "../../../lib/auth-context";
 import {
@@ -51,7 +52,13 @@ export default function TeamPage() {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Role>("member");
   const [inviting, setInviting] = useState(false);
+  // Doubles as the "here's the link" reveal for both a freshly created
+  // invite and a just-regenerated one — same shape (InviteCreateResult),
+  // same one-time reveal treatment, same reason: the token is never
+  // returned by GET /invites (see InviteRead's docstring), so this is the
+  // only moment it's ever visible.
   const [lastInvite, setLastInvite] = useState<InviteCreateResult | null>(null);
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
 
   const loadMembers = useCallback(async () => {
     const res = await apiFetch("/api/org/members");
@@ -131,6 +138,26 @@ export default function TeamPage() {
     }
   }
 
+  // Regenerating deletes the old invite row and creates a new one with a
+  // fresh token (see regenerate_invite in apps/api/app/api/invites.py for
+  // why it's delete-then-recreate rather than an in-place token update) --
+  // the old link stops working the instant this succeeds, not just once
+  // someone happens to notice. loadInvites() picks up the new row (a new
+  // id) in place of the old one.
+  async function handleRegenerate(inviteId: string) {
+    setError(null);
+    setRegeneratingId(inviteId);
+    const res = await apiFetch(`/api/invites/${inviteId}/regenerate`, { method: "POST" });
+    if (res.ok) {
+      setLastInvite(mapInviteCreateResult(await res.json()));
+      await loadInvites();
+    } else {
+      const data = await res.json().catch(() => null);
+      setError(data?.detail ?? "Failed to regenerate invite.");
+    }
+    setRegeneratingId(null);
+  }
+
   return (
     <div className="flex flex-1 flex-col items-center px-4 py-10">
       <div className="flex w-full max-w-2xl flex-col gap-6">
@@ -176,11 +203,13 @@ export default function TeamPage() {
             </form>
 
             {lastInvite && (
-              <div className="rounded-md border border-accent bg-accent-subtle p-3 text-sm">
+              <div className="flex flex-col gap-1.5 rounded-md border border-accent bg-accent-subtle p-3 text-sm">
                 <p className="text-accent-subtle-text">
-                  Emailing invites isn&apos;t wired up yet — copy this link and share it manually:
+                  Emailing invites isn&apos;t wired up yet — copy this link and share it manually
+                  with <span className="font-medium">{lastInvite.email}</span>. It won&apos;t be
+                  shown again — if it&apos;s lost, regenerate it below.
                 </p>
-                <p className="mt-1 truncate font-mono text-xs text-ink">{lastInvite.link}</p>
+                <CopyableLink link={lastInvite.link} />
               </div>
             )}
           </div>
@@ -263,11 +292,35 @@ export default function TeamPage() {
                           {status}
                         </span>
                         {status === "pending" && (
+                          <>
+                            <button
+                              onClick={() => handleRegenerate(invite.id)}
+                              disabled={regeneratingId === invite.id}
+                              className="rounded-md border border-line px-2.5 py-1 text-xs font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover disabled:opacity-50"
+                            >
+                              {regeneratingId === invite.id ? "Regenerating…" : "Regenerate link"}
+                            </button>
+                            <button
+                              onClick={() => handleRevoke(invite.id)}
+                              className="rounded-md border border-line px-2.5 py-1 text-xs font-medium text-danger transition-colors duration-100 hover:border-danger hover:bg-danger-bg"
+                            >
+                              Revoke
+                            </button>
+                          </>
+                        )}
+                        {/* An expired, unaccepted invite can still be
+                            regenerated -- arguably the most common real
+                            case (the link was lost, and by the time anyone
+                            noticed it had also expired) -- so this isn't
+                            gated behind "pending" the way Revoke's own
+                            button visibility is. */}
+                        {status === "expired" && (
                           <button
-                            onClick={() => handleRevoke(invite.id)}
-                            className="rounded-md border border-line px-2.5 py-1 text-xs font-medium text-danger transition-colors duration-100 hover:border-danger hover:bg-danger-bg"
+                            onClick={() => handleRegenerate(invite.id)}
+                            disabled={regeneratingId === invite.id}
+                            className="rounded-md border border-line px-2.5 py-1 text-xs font-medium text-ink transition-colors duration-100 hover:border-line-strong hover:bg-hover disabled:opacity-50"
                           >
-                            Revoke
+                            {regeneratingId === invite.id ? "Regenerating…" : "Regenerate link"}
                           </button>
                         )}
                       </div>

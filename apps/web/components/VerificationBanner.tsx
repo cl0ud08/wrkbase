@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import CopyableLink from "./CopyableLink";
+
 // Soft-nudge, not a gate — see apps/api/app/db/models.py's
 // User.is_verified docstring. Shown on every page while unverified
 // (ShellLayout only renders this when user && !user.isVerified), never
@@ -23,8 +25,8 @@ export default function VerificationBanner({ email }: { email: string }) {
   }
 
   return (
-    <div className="flex flex-col gap-1 border-b border-line-subtle bg-info-bg px-4 py-2 text-xs sm:flex-row sm:items-center sm:justify-between">
-      <span className="text-info">
+    <div className="flex flex-col gap-1.5 border-b border-line-subtle bg-info-bg px-4 py-2 text-xs sm:flex-row sm:items-center sm:justify-between">
+      <span className="flex-shrink-0 text-info">
         Your email isn&apos;t verified yet. Wrkbase works fine either way — verifying just makes sure
         we can reach you for things like password resets.
       </span>
@@ -38,12 +40,16 @@ export default function VerificationBanner({ email }: { email: string }) {
         </button>
       )}
       {state === "sent" && link && (
-        <a
-          href={link}
-          className="flex-shrink-0 truncate font-mono text-info underline decoration-dotted sm:max-w-xs"
-        >
-          Dev mode: {link}
-        </a>
+        <div className="flex items-center gap-2 sm:max-w-xs sm:flex-1">
+          <span className="flex-shrink-0 text-info">Dev mode:</span>
+          <CopyableLink link={link} />
+          <button
+            onClick={() => setState("idle")}
+            className="flex-shrink-0 font-medium text-info underline decoration-dotted"
+          >
+            Resend
+          </button>
+        </div>
       )}
     </div>
   );
