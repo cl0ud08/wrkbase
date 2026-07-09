@@ -22,6 +22,13 @@ class TicketType(str, enum.Enum):
     SUBTASK = "subtask"
 
 
+class TicketPriority(str, enum.Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
 class SprintStatus(str, enum.Enum):
     PLANNED = "planned"
     ACTIVE = "active"
@@ -324,6 +331,25 @@ class Ticket(Base):
     # _total_points in app/api/sprints.py, which sums only non-NULL values
     # (Postgres SUM already ignores NULLs, so this falls out for free).
     story_points: Mapped[int | None] = mapped_column(nullable=True)
+    # NULL = pending_triage; set once, together with triaged_at, by
+    # worker/main.py — never settable via TicketCreate/TicketUpdate. This
+    # slice hardcodes a placeholder value rather than calling a real LLM
+    # (see worker/main.py) — the column and its async plumbing are what
+    # this slice actually proves, not triage quality.
+    priority: Mapped[TicketPriority | None] = mapped_column(
+        Enum(
+            TicketPriority,
+            name="ticket_priority",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=True,
+    )
+    # NULL = pending_triage, non-NULL = triaged — the same nullable-
+    # timestamp-as-state idiom as accepted_at/read_at/used_at elsewhere in
+    # this app, not a new status enum (see migration 0017 for why a third
+    # state isn't needed yet).
+    triaged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), server_onupdate=FetchedValue()

@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.db.models import TicketType
+from app.db.models import TicketPriority, TicketType
 
 
 class TicketCreate(BaseModel):
@@ -66,6 +66,10 @@ class TicketRead(BaseModel):
     # that sprint was completed — see complete_sprint in app/api/sprints.py.
     sprint_id: uuid.UUID | None
     story_points: int | None
+    # Both NULL together = pending_triage; set once, together, by
+    # worker/main.py — not settable via TicketCreate/TicketUpdate.
+    priority: TicketPriority | None
+    triaged_at: datetime | None
     created_at: datetime
     updated_at: datetime
     # Not settable via TicketUpdate — only DELETE/{id}/restore touch this.
