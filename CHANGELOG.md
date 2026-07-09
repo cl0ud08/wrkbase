@@ -1934,3 +1934,136 @@ scripted equivalent of that exact sequence instead of a literal
 DevTools check, and it connects successfully end to end. All 9
 existing proof scripts re-run with no regressions; `ruff check .`,
 frontend `ESLint`, `tsc --noEmit`, and a full `next build` all clean.
+
+---
+
+## Slice 23 — Phase 2, slice 2: Redis pub/sub for live board updates
+
+**Built:** `update_ticket` publishes to `project:{project_id}` whenever
+a PATCH touches a `_COLLABORATIVE_FIELDS` key; every WebSocket
+connection to that project subscribes to the same channel and forwards
+matching messages straight through to its client. The board page
+applies an incoming change directly to local state instead of
+refetching. No new endpoints — this slice wires the connection built
+in Slice 22 up to something real.
+
+**Payload: a minimal diff, not the full ticket, and why `updated_by`
+replaces server-side echo suppression.**
+`{type: "ticket.updated", project_id, ticket_id, changes, updated_by}`.
+`changes` only ever contains the subset of `_COLLABORATIVE_FIELDS`
+actually present in the triggering PATCH — never the full `TicketRead`
+shape, which would mean building and shipping a complete resource over
+the wire for every move, defeating the entire "diff, not refetch"
+point — and never a content field (title/description/type/parent_id),
+which doesn't broadcast at all, since this event type exists for board
+interaction, not content edits. `updated_by` is the acting user's id,
+included specifically so a *receiving* client can recognize its own
+change echoing back and skip re-applying it. The alternative — the
+server tracking which connections belong to which user and
+deliberately not forwarding a publish back to its own author — would
+mean either per-connection filtering logic in `app/api/ws.py` (a
+second thing that could leak or misfire, on top of the channel-scoping
+this slice already leans on for tenant isolation) or a second Redis
+message shape carrying connection identity instead of user identity.
+Tagging the payload with who caused it and letting every subscriber
+independently decide what to do with that is simpler and pushes the
+decision to the side that actually has the context to make it: the
+receiving tab already knows whether the id in `updated_by` is itself.
+
+**Subscription design: one dedicated `pubsub` per connection, not a
+shared one with in-process routing.** Every WebSocket connection to
+`app/api/ws.py` opens its own `redis_client.pubsub()` and calls
+`.subscribe(project_channel(project_id))` independently — two people
+with the same project open means two separate Redis-level
+subscriptions to the same channel name, not one shared subscription
+locally fanned out to two in-memory listeners. This costs slightly
+more Redis-side connections than a shared-subscription-plus-demux
+design would (a real, deliberate tradeoff, revisited only if
+connection *count* ever actually becomes this app's bottleneck — it
+is nowhere close at this app's real scale). What it buys: there is no
+per-connection dispatch table in this process that a bug could get
+wrong. Redis's own pub/sub primitive is what fans one published
+message out to every subscriber of a channel; this app never
+re-implements that step itself, so there's nothing here for a leak
+between independently-authenticated sessions to hide in. Verified
+directly, not just argued: `PUBSUB NUMSUB` showed exactly 2 real
+subscribers while two tabs were connected to the same project, and
+exactly 1 immediately after one of them disconnected — see below.
+
+**Proving multi-process fan-out required two literal separate
+processes — and explains why a weaker test wouldn't have proven
+anything.** The entire reason Redis pub/sub was chosen here over an
+in-process event emitter (an `asyncio.Queue`, a dict of callbacks) is
+that a single running API instance's memory isn't a reliable channel
+between two different requests in production — there's more than one
+worker, potentially more than one machine. But that's exactly the
+property a naive test can fail to actually exercise: every check in
+`verify_ws_pubsub.py` would pass identically against a broken,
+purely-in-process implementation, *as long as the test only ever runs
+one API process* — which is what this repo's CI already did for every
+other proof script, and what running the new script against a single
+`uvicorn` instance would have silently continued doing. A `--scale`-based
+Docker Compose scale-out was considered and rejected for the same
+reason: a load balancer would pick which of N processes handles which
+request, non-deterministically, giving no way to *guarantee* the
+mutating PATCH and the receiving WebSocket landed on different
+processes on any given run — a proof that only sometimes proves
+anything isn't a proof. Instead, CI starts a second, literal `uvicorn`
+process on a different port (8001), sharing only Postgres and Redis
+with the first (8000) — no shared Python interpreter, no shared
+memory, nothing but the two real infrastructure dependencies this
+slice actually depends on. `verify_ws_pubsub.py` deliberately routes
+one WebSocket connection through port 8000 and the other through port
+8001, then issues the mutating PATCH through port 8000 only. Port
+8001's connection receiving that event is only possible if it
+travelled through Redis — port 8001's process never executed a single
+line of the PATCH handler that produced it.
+
+**`PUBSUB NUMSUB` proves cleanup, not just accepts that the code looks
+right.** `app/api/ws.py`'s `finally` block calls
+`pubsub.unsubscribe(...)` and `pubsub.aclose()` on every exit path —
+normal disconnect, the Slice 22 expiry timer firing, or an unhandled
+error. Trusting that from reading the code would have been exactly
+the kind of "should work" claim this project's proof-script discipline
+exists to replace with a real check: `verify_ws_pubsub.py` opens two
+connections, confirms `PUBSUB NUMSUB project:{id}` reports `2`,
+closes one, and confirms it reports `1` — a lingering `2` would mean
+a closed connection is still silently consuming a Redis subscription
+slot indefinitely, exactly the kind of resource leak that's invisible
+in a two-connection dev test and only shows up as Redis running out of
+subscriber slots after days of real production traffic.
+
+**Frontend: a stale-closure bug caught before it shipped, not after.**
+The board page's WebSocket `onmessage` handler lives inside a
+`useEffect` that only re-runs on `[projectId, user?.id]` — not on
+every `tickets` change, which would mean tearing down and reopening
+the socket on every single board update, fighting with the very
+events it exists to receive. That means the handler can never safely
+read `tickets` directly from render scope the way `handleDragEnd`
+does a few lines below it (that one's fine — it's called fresh from a
+DnD event on the current render, not from a long-lived effect closure)
+— doing so here would permanently close over whatever `tickets` was
+on the render the effect last ran, silently overwriting every future
+local update with a stale snapshot the moment the first live event
+arrived. Fixed by using `setTickets`'s functional-update form
+(`setTickets((prev) => prev?.map(...))`), which reads the current
+state at update time regardless of what the effect's closure
+captured — the same category of bug as the RETURNING-gated-by-
+SELECT-policy discovery in Slice 21: not caught by any type checker or
+lint rule, only by actually tracing what a specific piece of framework
+machinery does under the hood.
+
+**Extended the proof-script pattern with `scripts/verify_ws_pubsub.py`:**
+two authenticated connections to the same project on the two separate
+processes above; a mutation on that project received by both
+(byte-identical payloads); a mutation on a second, unrelated project
+received by neither, within a timeout; the `PUBSUB NUMSUB` cleanup
+check above; and the surviving connection still receiving events
+normally after the other one disconnects.
+
+**Verified:** all 9 prior proof scripts plus `verify_ws.py` re-run
+with no regressions; the new `verify_ws_pubsub.py` passes against the
+genuine two-process setup, in CI and locally; `ruff check .` clean;
+`pip-audit` shows only the same pre-existing `pip`-tool CVEs, unrelated
+to this slice; frontend `ESLint`, `tsc --noEmit`, and a full
+`next build` all clean.

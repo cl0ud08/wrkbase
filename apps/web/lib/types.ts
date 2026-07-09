@@ -129,6 +129,55 @@ export function mapTicketPage(data: TicketPageApiResponse): TicketPage {
   };
 }
 
+// Pushed over the project WebSocket (see apps/api/app/services/ticket_events.py)
+// whenever a collaborative field changes — a deliberately minimal diff, not
+// a full Ticket, so a connected client can splice it into local state
+// without a round trip. Only ever the subset of fields that actually
+// changed, hence Partial rather than every field being required.
+export interface TicketUpdatedEvent {
+  type: "ticket.updated";
+  projectId: string;
+  ticketId: string;
+  changes: Partial<
+    Pick<Ticket, "workflowStateId" | "position" | "assigneeId" | "sprintId" | "storyPoints">
+  >;
+  // The acting user's id — lets a receiving client tell "someone else moved
+  // this" apart from its own change echoing back, without needing the
+  // server to suppress the echo itself (every subscriber gets every
+  // event, uniformly, including the one who caused it).
+  updatedBy: string;
+}
+
+interface TicketUpdatedEventApiPayload {
+  type: "ticket.updated";
+  project_id: string;
+  ticket_id: string;
+  changes: {
+    workflow_state_id?: string;
+    position?: number;
+    assignee_id?: string | null;
+    sprint_id?: string | null;
+    story_points?: number | null;
+  };
+  updated_by: string;
+}
+
+export function mapTicketUpdatedEvent(data: TicketUpdatedEventApiPayload): TicketUpdatedEvent {
+  const changes: TicketUpdatedEvent["changes"] = {};
+  if ("workflow_state_id" in data.changes) changes.workflowStateId = data.changes.workflow_state_id;
+  if ("position" in data.changes) changes.position = data.changes.position;
+  if ("assignee_id" in data.changes) changes.assigneeId = data.changes.assignee_id ?? null;
+  if ("sprint_id" in data.changes) changes.sprintId = data.changes.sprint_id ?? null;
+  if ("story_points" in data.changes) changes.storyPoints = data.changes.story_points ?? null;
+  return {
+    type: data.type,
+    projectId: data.project_id,
+    ticketId: data.ticket_id,
+    changes,
+    updatedBy: data.updated_by,
+  };
+}
+
 export type SprintStatus = "planned" | "active" | "completed";
 
 export interface Sprint {

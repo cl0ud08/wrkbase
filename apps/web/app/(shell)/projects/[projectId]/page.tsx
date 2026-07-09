@@ -19,6 +19,7 @@ import { useAuth } from "../../../../lib/auth-context";
 import {
   mapMember,
   mapTicket,
+  mapTicketUpdatedEvent,
   mapWorkflowState,
   type Member,
   type Ticket,
@@ -238,12 +239,22 @@ export default function ProjectBoardPage() {
     })();
   }, [load]);
 
-  // Phase 2 slice 1: prove the connection itself, nothing more yet -- no
-  // pub/sub, no rendered state, just real connection-lifecycle logging so
-  // this is actually verifiable by hand in a browser, not just by reading
-  // the code. cancelled guards against the ticket fetch resolving after a
-  // fast unmount (e.g. navigating away before it returns), which would
-  // otherwise leak an open socket nothing is tracking anymore.
+  // Live board updates: a workflow_state_id/position/assignee/sprint/
+  // story_points change made by anyone else connected to this project
+  // arrives here and is spliced directly into local state, the same
+  // "instant local update, no round trip" reasoning as handleDragEnd's own
+  // optimistic move below -- just triggered by someone else's action
+  // instead of this tab's own drag. updatedBy === user.id is skipped: this
+  // tab already applied its own change optimistically the moment it made
+  // it, so re-applying the echoed event would be redundant at best and a
+  // stale overwrite at worst if a second local action happened before the
+  // echo arrived. setTickets uses the functional form specifically so this
+  // handler never closes over a stale `tickets` snapshot from whenever the
+  // effect last ran -- it only re-runs on [projectId, user?.id], not on
+  // every ticket change. A ticket id not found in local state (filtered
+  // out of the current view, e.g. a future sprint filter) is a silent
+  // no-op, not an error -- there's nothing to splice the change into, and
+  // a full refetch would defeat the point of pushing a diff at all.
   useEffect(() => {
     let socket: WebSocket | null = null;
     let cancelled = false;
@@ -262,13 +273,22 @@ export default function ProjectBoardPage() {
       ws.onopen = () => console.log("[ws] connected to project", projectId);
       ws.onclose = (e) => console.log("[ws] closed", e.code, e.reason);
       ws.onerror = () => console.log("[ws] error");
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type !== "ticket.updated") return;
+        const event = mapTicketUpdatedEvent(data);
+        if (event.updatedBy === user?.id) return;
+        setTickets((prev) =>
+          prev?.map((t) => (t.id === event.ticketId ? { ...t, ...event.changes } : t)) ?? prev,
+        );
+      };
     })();
 
     return () => {
       cancelled = true;
       socket?.close();
     };
-  }, [projectId]);
+  }, [projectId, user?.id]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
