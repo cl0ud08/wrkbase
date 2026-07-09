@@ -7,6 +7,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.invites import router as invites_router
+from app.api.notifications import router as notifications_router
 from app.api.org import router as org_router
 from app.api.projects import router as projects_router
 from app.api.sprints import router as sprints_router
@@ -52,4 +53,5 @@ app.include_router(sprints_router)
 app.include_router(workflow_states_router)
 app.include_router(invites_router)
 app.include_router(org_router)
+app.include_router(notifications_router)
 app.include_router(ws_router)

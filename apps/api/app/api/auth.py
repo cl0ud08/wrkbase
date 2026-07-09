@@ -22,6 +22,7 @@ from app.db.models import (
     EmailVerificationToken,
     Invite,
     InviteLookup,
+    NotificationType,
     Organization,
     PasswordResetToken,
     User,
@@ -46,6 +47,7 @@ from app.schemas.auth import (
     TokenPair,
     WsTicketResponse,
 )
+from app.services.notifications import create_notification, publish_notification
 from app.services.refresh_tokens import (
     pop_refresh_token,
     revoke_all_refresh_tokens_for_user,
@@ -71,12 +73,13 @@ _INVALID_VERIFICATION_TOKEN = HTTPException(
 )
 
 
-async def _redeem_invite(db: AsyncSession, token: str, email: str) -> tuple[uuid.UUID, UserRole]:
-    """Validate an invite token and mark it accepted, returning the
-    (org_id, role) the new user should be created with. Does NOT commit —
-    the caller commits this together with the User insert, in one
-    transaction, so a token can never be marked accepted without the user
-    it was accepted for actually existing (and vice versa).
+async def _redeem_invite(db: AsyncSession, token: str, email: str) -> Invite:
+    """Validate an invite token and mark it accepted, returning the invite
+    row itself — org_id, role, invited_by (for the invite_accepted
+    notification) all read off it by the caller. Does NOT commit — the
+    caller commits this together with the User insert, in one transaction,
+    so a token can never be marked accepted without the user it was
+    accepted for actually existing (and vice versa).
     """
     # Step 1: same two-step shape as login() below — find the org from an
     # unguessable token BEFORE any tenant context exists to scope an
@@ -116,7 +119,7 @@ async def _redeem_invite(db: AsyncSession, token: str, email: str) -> tuple[uuid
     # ordinary "Email already in use" 409 a few lines down, not a new
     # locking mechanism built for this.
     invite.accepted_at = datetime.now(timezone.utc)
-    return invite.org_id, invite.role
+    return invite
 
 
 def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: str) -> None:
@@ -194,8 +197,10 @@ async def signup(
     # valid invite_token: join that invite's existing org, with that
     # invite's role, instead — org_name is ignored.
     is_invited = bool(payload.invite_token)
+    invite = None
     if is_invited:
-        org_id, role = await _redeem_invite(db, payload.invite_token, payload.email)
+        invite = await _redeem_invite(db, payload.invite_token, payload.email)
+        org_id, role = invite.org_id, invite.role
     else:
         # id generated client-side, not left to the column's
         # gen_random_uuid() server default: Postgres requires a row to
@@ -227,11 +232,35 @@ async def signup(
         is_verified=is_invited,
     )
     db.add(user)
+
+    # Same transaction as the user insert above, not a separate commit
+    # afterward: either the whole signup succeeds — invite marked
+    # accepted, user created, admin notified — or none of it does. invite
+    # is only None on the self-serve (no invite_token) path; invited_by is
+    # nullable (SET NULL if that admin was later removed — see Invite's
+    # docstring), and there's no one left to notify in that case.
+    notification = None
+    if invite is not None and invite.invited_by is not None:
+        notification = await create_notification(
+            db,
+            org_id=org_id,
+            user_id=invite.invited_by,
+            type=NotificationType.INVITE_ACCEPTED,
+            payload={
+                "invite_id": str(invite.id),
+                "accepted_email": payload.email,
+                "role": role.value,
+            },
+        )
+
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already in use")
+
+    if notification is not None:
+        await publish_notification(notification)
 
     verification_link = None if is_invited else await _issue_verification_token(db, user.id)
 

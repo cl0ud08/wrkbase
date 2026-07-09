@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
 from app.db.models import (
+    NotificationType,
     Organization,
     Project,
     Sprint,
@@ -18,6 +19,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
+from app.services.notifications import create_notification, publish_notification
 from app.services.ticket_events import publish_ticket_update
 
 router = APIRouter(prefix="/projects/{project_id}/tickets", tags=["tickets"])
@@ -405,10 +407,39 @@ async def update_ticket(
     if update_data.get("sprint_id") is not None:
         await _validate_sprint(db, project_id, update_data["sprint_id"])
 
+    # Captured before the mutation loop below overwrites it: this is what
+    # tells a reassignment (notify) apart from "PATCHed to the assignee it
+    # already had" (don't) — the field being present in update_data alone
+    # doesn't mean it's actually changing.
+    previous_assignee_id = ticket.assignee_id
+
     for field, value in update_data.items():
         setattr(ticket, field, value)
 
+    new_assignee_id = update_data.get("assignee_id")
+    notification = None
+    if (
+        new_assignee_id is not None
+        and new_assignee_id != previous_assignee_id
+        and new_assignee_id != auth.user_id  # assigning to yourself needs no notification
+    ):
+        notification = await create_notification(
+            db,
+            org_id=auth.org_id,
+            user_id=new_assignee_id,
+            type=NotificationType.ASSIGNMENT,
+            payload={
+                "ticket_id": str(ticket.id),
+                "project_id": str(project_id),
+                "ticket_title": ticket.title,
+                "assigned_by": str(auth.user_id),
+            },
+        )
+
     await db.commit()
+
+    if notification is not None:
+        await publish_notification(notification)
 
     # Live-board fan-out: only the collaborative subset, even for a
     # request that also touched a content field in the same PATCH (the
