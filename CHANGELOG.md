@@ -2361,3 +2361,147 @@ against a genuine second process) re-run with no regressions; the new
 `verify_notifications.py` (12 checks) passes; `ruff check .` clean;
 `pip-audit` shows only the same pre-existing `pip`-tool CVEs;
 frontend `ESLint`, `tsc --noEmit`, and a full `next build` clean.
+
+---
+
+## Slice 26 — Phase 3, slice 1: async ticket triage, and RabbitMQ's
+actual first real use
+
+**Correction, stated plainly rather than quietly worked around:**
+RabbitMQ was believed to already be present in `docker-compose.yml`,
+provisioned since Phase 0 and simply unused. Checked before writing
+anything, per this project's own standing rule — it wasn't there. No
+service, no client library, no reference anywhere in the codebase.
+Built from scratch this slice, not "wired up": the `rabbitmq` service
+(with a real app user, not the `guest`/`guest` default, which
+RabbitMQ itself refuses to accept from anywhere but localhost — this
+app's containers are never that to each other), `aio-pika` as the
+client, and a `TriageJob` message contract.
+
+**Built:** `POST /projects/{id}/tickets` now publishes a `TriageJob`
+instead of doing anything synchronously, returning immediately with
+the ticket `pending_triage`; a new `worker` Compose service consumes
+the queue, sets `priority`/`triaged_at`, and pushes the result live
+over the board's existing WebSocket room; a small "AI triaging…" badge
+clears itself the instant that arrives. No real LLM call yet —
+`priority` is a hardcoded placeholder, deliberately not derived from
+the ticket's content, so nothing about this slice's output could be
+mistaken for actual triage quality. That's next.
+
+**A separate service, not a separate deployable — and specifically not
+one that runs its own migrations.** `worker` builds from the exact
+same `./apps/api` image and codebase as `api` (the Dockerfile's
+`COPY . .` already includes `worker/`); only the container `command`
+differs. It deliberately does **not** run `entrypoint.sh` — only one
+service should ever execute `alembic upgrade head` at container start,
+and `api` already owns that. Two containers racing to migrate on a
+simultaneous cold start is exactly the kind of concurrency bug worth
+not creating in the first place, not one worth handling gracefully
+after the fact.
+
+**`pending_triage` reuses the nullable-timestamp-as-state idiom, not a
+new enum.** `priority` and `triaged_at` are both nullable on `tickets`;
+`triaged_at IS NULL` *is* `pending_triage`, the same shape as
+`accepted_at`/`read_at`/`used_at` elsewhere in this app rather than a
+fourth status concept invented for one table. Both are set together,
+once, only by the worker — never via `TicketCreate`/`TicketUpdate`.
+
+**Ack/nack: the library's actual default, checked, then deliberately
+kept.** aio-pika requires an explicit ack/nack/reject per message
+unless a consumer opts into `no_ack=True` — confirmed by reading the
+library's real behavior before relying on it, not assumed. That
+default (nothing auto-acknowledged) is what `worker/main.py` uses,
+on purpose: a message is only acked after the DB commit *and* the
+Redis publish both succeed. `prefetch_count=1` is set explicitly too
+— the undocumented-but-real default with no QoS configured is for
+RabbitMQ to hand a connected consumer every ready message at once,
+which would let whichever worker connects first drain the entire
+queue and starve a second one, defeating the whole point of running
+more than one.
+
+**Both reliability properties requirement 5 asked about were proven
+empirically, not reasoned about and left there:**
+
+- **A worker crashing mid-job doesn't lose the job.** Tested in
+  complete isolation, on its own throwaway queue rather than the real
+  one (so it can't race the actual running worker(s)): a message is
+  received but deliberately never acked, then the connection is
+  closed — simulating a crash. A fresh consumer on the same queue
+  receives the identical message again, and — the stronger check, not
+  just "a message arrived" — with RabbitMQ's own `redelivered` flag
+  set to `True`, confirming the broker itself recognizes this as a
+  redelivery, not a coincidence.
+- **Two workers competing for the same queue never double-process a
+  job.** A real second worker process (not a mocked one) was started
+  and left running; five tickets created concurrently produced exactly
+  five triage-completion events over the board's WebSocket room — not
+  four, not six. More than five would have meant a job got processed
+  twice; this is what actually rules that out, not just RabbitMQ's
+  documented competing-consumers guarantee taken on faith.
+
+**Tenant context in a process with no natural request or connection
+boundary — the genuinely new variant of a question this project has
+now answered three ways.** HTTP has one request; a WebSocket
+connection has one handshake, bounded by the same 15-minute staleness
+ceiling as everything else. A worker has neither: it's a loop
+processing an unbounded sequence of jobs for however many different
+orgs happen to publish one, over a lifetime that could span days.
+There is no ambient "current org" for the process itself — only
+whichever job is being handled *right now*. So context is established
+fresh, on a brand-new short-lived session, from that one job's own
+payload, every single time — never held across jobs, never assumed
+from whatever the previous job happened to be.
+
+That still leaves the question every other defense-in-depth decision
+in this app has already asked once: is the job's claimed `org_id`
+trusted blindly? No. The very first thing the worker does with it is
+an RLS-scoped lookup of the job's `ticket_id` *under that claimed
+org's context* — not a raw by-id fetch. Proved this isn't just
+theoretical: `verify_triage.py` publishes a job claiming org A's real
+ticket under org B's `org_id`, directly, bypassing the API entirely.
+The RLS-scoped lookup finds nothing (org B's context can never see org
+A's row), the worker rejects it as a poison message, and org A's
+ticket comes back completely unchanged afterward — not silently
+corrupted, not retried forever.
+
+**A real bug found by actually cold-starting the stack, not assumed
+away.** The worker's very first boot crashed outright: RabbitMQ's own
+healthcheck (`rabbitmq-diagnostics ping`) can report healthy slightly
+before the AMQP listener on 5672 is actually accepting connections,
+and aio-pika's `connect_robust` only reconnects *after* an initial
+connection succeeds — its first-attempt retry budget isn't unlimited,
+and exhausting it raises. With no restart policy on the `worker`
+service, that's a permanently dead container; Compose does not retry
+a crashed one-shot process on its own. Fixed with `restart:
+on-failure` and confirmed working, not just plausible: a forced cold
+restart of both `rabbitmq` and `worker` together showed
+`RestartCount: 1` on the worker — it crashed once, exactly as
+predicted, and healed itself with no manual intervention.
+
+**Extended the proof-script pattern with `scripts/verify_triage.py`,**
+reaching directly into `app.services.queue` to construct deliberately
+adversarial messages the real API would never publish — the same
+"raw internals, not just black-box HTTP" precedent `verify_rls.py`
+already established. Covers: `pending_triage` immediately on creation,
+before any worker involvement; the live WebSocket update on
+completion; tenant isolation for the async path (a second org's board
+room never receives another org's triage events); the cross-org
+poisoned-job rejection above; both reliability proofs above; and the
+competing-consumers proof above. A genuine test-ordering race was
+caught and fixed while building this: the live-update check originally
+created its ticket *before* opening the WebSocket connection, and with
+two idle workers competing, the job routinely finished before the
+subscription existed to receive it — Redis pub/sub has no replay for a
+not-yet-connected subscriber (already documented in
+`ticket_events.py`), so this wasn't a system bug, but it was a real
+bug in what the test was actually proving. Fixed by connecting first,
+the same order a real client always uses.
+
+**Verified:** all 11 prior proof scripts re-run with no regressions,
+including `verify_tickets_rls` (exercises `create_ticket` directly,
+now publishing a real job on every run) and `verify_ws_pubsub` against
+a genuine second API process; the new `verify_triage.py` (8 checks)
+passes with two real competing worker processes running; `ruff check .`
+clean; `pip-audit` shows only the same pre-existing `pip`-tool CVEs,
+nothing new from `aio-pika`; frontend `ESLint`, `tsc --noEmit`, and a
+full `next build` clean.

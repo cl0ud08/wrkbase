@@ -36,6 +36,7 @@ export function mapProject(data: ProjectApiResponse): Project {
 }
 
 export type TicketType = "epic" | "story" | "task" | "subtask";
+export type TicketPriority = "low" | "medium" | "high" | "critical";
 
 export interface Ticket {
   id: string;
@@ -57,6 +58,13 @@ export interface Ticket {
   // null = in the backlog (see fetchBacklog / mapSprint below).
   sprintId: string | null;
   storyPoints: number | null;
+  // Both null together = pending_triage — the async worker (see
+  // apps/api/worker/main.py) hasn't set them yet. A ticket is always
+  // created this way; the board page renders an "AI triaging…" badge
+  // for exactly this state and clears it on the live update that sets
+  // both, no polling involved.
+  priority: TicketPriority | null;
+  triagedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -80,6 +88,8 @@ interface TicketApiResponse {
   ticket_number: number;
   sprint_id: string | null;
   story_points: number | null;
+  priority: TicketPriority | null;
+  triaged_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -100,6 +110,8 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     ticketNumber: data.ticket_number,
     sprintId: data.sprint_id,
     storyPoints: data.story_points,
+    priority: data.priority,
+    triagedAt: data.triaged_at,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
   };
@@ -139,12 +151,25 @@ export interface TicketUpdatedEvent {
   projectId: string;
   ticketId: string;
   changes: Partial<
-    Pick<Ticket, "workflowStateId" | "position" | "assigneeId" | "sprintId" | "storyPoints">
+    Pick<
+      Ticket,
+      | "workflowStateId"
+      | "position"
+      | "assigneeId"
+      | "sprintId"
+      | "storyPoints"
+      | "priority"
+      | "triagedAt"
+    >
   >;
   // The acting user's id — lets a receiving client tell "someone else moved
   // this" apart from its own change echoing back, without needing the
   // server to suppress the echo itself (every subscriber gets every
-  // event, uniformly, including the one who caused it).
+  // event, uniformly, including the one who caused it). The worker
+  // publishes its own triage-complete update with a fixed all-zero
+  // sentinel here (see apps/api/app/services/ticket_events.py's
+  // SYSTEM_ACTOR_ID) since there's no human actor to attribute it to —
+  // it can never equal a real user.id, so it's never treated as an echo.
   updatedBy: string;
 }
 
@@ -158,6 +183,8 @@ interface TicketUpdatedEventApiPayload {
     assignee_id?: string | null;
     sprint_id?: string | null;
     story_points?: number | null;
+    priority?: TicketPriority;
+    triaged_at?: string;
   };
   updated_by: string;
 }
@@ -169,6 +196,8 @@ export function mapTicketUpdatedEvent(data: TicketUpdatedEventApiPayload): Ticke
   if ("assignee_id" in data.changes) changes.assigneeId = data.changes.assignee_id ?? null;
   if ("sprint_id" in data.changes) changes.sprintId = data.changes.sprint_id ?? null;
   if ("story_points" in data.changes) changes.storyPoints = data.changes.story_points ?? null;
+  if ("priority" in data.changes) changes.priority = data.changes.priority;
+  if ("triaged_at" in data.changes) changes.triagedAt = data.changes.triaged_at;
   return {
     type: data.type,
     projectId: data.project_id,

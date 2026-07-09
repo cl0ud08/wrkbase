@@ -106,6 +106,16 @@ function Card({
         <TypeBadge type={ticket.type} />
       </div>
       <p className="mb-2 leading-snug text-ink">{ticket.title}</p>
+      {/* pending_triage (both null together) clears itself the instant the
+          worker's live update arrives over the board's own WebSocket
+          connection — no polling, no separate fetch, the exact same
+          onmessage splice every other live board update already uses. */}
+      {ticket.triagedAt === null && (
+        <div className="mb-2 flex items-center gap-1.5 text-[10px] text-ink-tertiary">
+          <span className="h-1 w-1 flex-shrink-0 animate-pulse rounded-full bg-accent" aria-hidden="true" />
+          AI triaging…
+        </div>
+      )}
       <div className="flex items-center justify-between gap-2">
         <span
           title={assignee ? assignee.email : "Unassigned"}
