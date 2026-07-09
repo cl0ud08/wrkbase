@@ -1762,3 +1762,175 @@ including its concurrent race check, which exercises the same
 guards — `verify_tickets_rls`, `verify_workflow_rls`) pass with no
 regressions; `ruff check .` clean; `pip-audit` shows only pre-existing
 `pip`-tool CVEs unrelated to any application dependency.
+
+---
+
+## Slice 22 — Phase 2, slice 1: an authenticated WebSocket connection
+
+**Built:** `WS /ws/projects/{project_id}` — one room per project, no
+pub/sub or message handling yet. This slice is entirely about the four
+ways into the connection: authenticate the handshake itself, verify
+the caller can reach the requested project, refuse Cross-Site
+WebSocket Hijacking, and bound how long the connection stays trusted
+once open. `POST /auth/ws-ticket` mints the short-lived credential the
+handshake authenticates with (see below). On the frontend,
+`lib/ws.ts` connects on the project board page and logs connection
+state to the console — nothing rendered yet, matching the backend's
+scope.
+
+**Token delivery: the full reasoning chain, not just "query param."**
+Every link here was checked, not assumed:
+
+1. The browser `WebSocket` constructor (`new WebSocket(url,
+   protocols?)`) has no headers argument at all — confirmed directly,
+   not assumed. This app's existing `Authorization: Bearer` path
+   (used by API clients and this app's own proof scripts) is simply
+   unavailable to a browser-originated socket; there is no header to
+   put it in.
+2. The httpOnly `access_token` cookie is scoped to the frontend's own
+   origin, by design — it only reaches the API today via the
+   same-origin Next.js rewrite proxy (`next.config.ts`), which is what
+   lets it stay httpOnly at all. Checked this project's own pinned
+   Next.js version's bundled docs (`node_modules/next/dist/docs`)
+   directly for whether `rewrites()` forwards a WebSocket Upgrade
+   request: no mention of WebSocket support anywhere in the
+   rewrites/proxy docs for this version. Rather than depend on
+   undocumented behavior, the socket connects straight to the API's
+   own origin — which also means the cookie wouldn't reliably arrive
+   here even if it weren't origin-scoped, since this is now a genuine
+   cross-origin browser connection.
+3. That leaves a query parameter as the only channel the browser
+   actually offers. The question that mattered was *what* travels
+   through it. Putting the real access token there was rejected
+   deliberately: a WS handshake URL persists in server access logs and
+   any intermediate proxy's logs for as long as the token in it stays
+   valid — roughly 15 minutes and freely reusable within that window,
+   a materially bigger exposure than this app accepts for a credential
+   anywhere else. Instead, `POST /auth/ws-ticket` — authenticated
+   completely normally, behind `get_current_auth`, over the existing
+   cookie-through-the-proxy path — mints a random, single-use, 30-
+   second ticket (Redis-backed, fetch-and-delete via `GETDEL`, the
+   same primitive `pop_refresh_token` already uses for exactly this
+   race). This is the same shape already established for invite,
+   password-reset, and email-verification tokens: an opaque credential
+   good for exactly one redemption, bridging a session into a context
+   that can't safely carry the real one. It satisfies "the existing
+   session's claims, delivered via query param" without the 15-minute,
+   reusable exposure a raw token would carry.
+
+**Tenant context for a connection with no natural transaction
+boundary.** Every prior use of `set_tenant_context` in this app has
+been "once, per transaction, for the one request currently using it"
+— `is_local=true` ties the setting to the transaction it was set in,
+discarded when that transaction ends (migration 0001's docstring).
+That model assumes a request is short-lived. A WebSocket connection
+isn't a request; it's a channel that can stay open for hours, with no
+transaction boundary to anchor context to. Holding one DB
+session/transaction open for the connection's entire life just to
+keep `app.current_org_id` set would mean an idle transaction sitting
+on a Postgres connection for hours — its own operational cost — for
+no benefit until a real query is actually needed (none yet, in this
+slice). So `org_id` is kept as a plain Python value on the connection
+instead, and would be re-applied via a fresh, short-lived
+`set_tenant_context` call each time a query is actually needed — the
+access-check below already does exactly this once, at connect time.
+
+**The staleness question, and why it's the same bug class as the
+`/auth/refresh` stale-role fix (Slice 12), just generalized.** Slice
+12 found `POST /auth/refresh` trusting a cached role from a refresh
+token's stored payload instead of re-checking the database — an admin
+demoting a user had no effect until that user's *next* refresh, up to
+15 minutes later, because refresh was the mechanism supposed to bring
+a session back in line with reality and wasn't. The question here is
+structurally identical: if this connection just trusts `org_id`/role
+for as long as the socket happens to stay open, a demotion, removal,
+or project-access change made two minutes into a six-hour-old
+connection would silently fail to apply until the client happened to
+reconnect on its own — an unbounded staleness window instead of a
+15-minute one, which is a regression from what this app already
+guarantees everywhere else, not a neutral gap. Two ways to close it:
+poll the database on some invented interval, or simply stop trusting
+the connection once the access token it descends from would have
+expired anyway, and require a genuine reconnect — fresh ticket, fresh
+handshake, fresh access-check — to continue. Chose the second:
+`settings.access_token_expire_minutes` (15 minutes) from connect time
+is reused directly as the connection's own lifetime ceiling, so a
+role or access change takes effect within the exact same bound every
+other credential in this app already has, with no new re-check
+interval invented and no separate polling mechanism to maintain.
+
+**CSWSH: verified against Starlette's actual source, not general
+WebSocket folklore.** A WebSocket handshake is an HTTP Upgrade
+request, but it does not inherit the same-origin-policy protection a
+normal `fetch`/XHR gets for free: SOP blocks a malicious page's JS
+from *reading* a cross-origin response, but a completed WebSocket
+handshake hands that page's JS a live, bidirectional connection with
+no equivalent read-blocking — and the browser attaches this origin's
+ambient cookies to that handshake exactly as it would to any other
+request to this host. That's Cross-Site WebSocket Hijacking. The
+question that mattered for this specific codebase: does
+`app.main`'s existing `CORSMiddleware` already stop this, the way it
+stops a normal cross-origin `fetch`? Checked directly by reading
+Starlette's installed `CORSMiddleware.__call__` source rather than
+assuming either way:
+
+```python
+async def __call__(self, scope, receive, send):
+    if scope["type"] != "http":  # pragma: no cover
+        await self.app(scope, receive, send)
+        return
+    ...
+```
+
+It passes any non-`"http"` scope straight through untouched —
+`"websocket"` included — so `CORSMiddleware` does nothing for this
+endpoint at all. A genuinely reusable fact about this specific stack,
+not general trivia: nothing in this app's middleware stack protects a
+WebSocket route from CSWSH unless the route checks for it itself. Fixed
+by verifying the handshake's `Origin` header against
+`settings.cors_origins_list` before doing anything else — the same
+env-driven allowlist HTTP already uses (local dev vs. a future
+deployed origin), not a second list to keep in sync.
+
+**Project access, same shape as every other resource.** RLS already
+scopes the access-check query to `org_id`, so a `project_id` from
+another org simply matches zero rows — indistinguishable from a
+project that doesn't exist, the same ambiguity `_get_project_or_404`
+deliberately preserves for HTTP. Checked with a short-lived session
+opened just for this one query, not the connection-lifetime session
+the tenant-context section above explains why to avoid.
+
+**Reject the upgrade, don't accept-then-close.** `websocket.close()`
+called *before* `websocket.accept()` makes uvicorn respond to the
+handshake's HTTP request with a non-101 status instead of completing
+the upgrade at all — confirmed via `verify_ws.py` catching
+`websockets.exceptions.InvalidStatus` specifically, which only raises
+when the 101 Switching Protocols response never happened. A client
+that briefly treats a connection as live before it's actually
+authorized is a materially worse failure mode than one that's refused
+outright during connect(); this app's four rejection paths (no
+ticket, invalid ticket, mismatched Origin, no project access) all
+close before accept for that reason.
+
+**Extended the proof-script pattern with `scripts/verify_ws.py`,**
+covering exactly the four rejection paths above (each individually
+confirmed as a handshake-level rejection, not accept-then-close), a
+reused ticket rejected on its second redemption (`GETDEL`'s
+single-use guarantee, proven, not just implemented), and the real
+happy path — connects, survives a 2-second idle period plus a live
+ping, and closes cleanly from the client side with no exception. The
+15-minute connection-expiry timer itself isn't exercised by CI (that
+would make every run 15 minutes slower for a mechanism review already
+covers); it's verified by code review and by the same
+`settings.access_token_expire_minutes` value already being proven
+correct as the HTTP staleness bound elsewhere in this app.
+
+**Verified beyond the proof script:** no browser automation tool was
+available in this environment, so the actual browser-facing path —
+cookie-based signup through the Next.js proxy, a cookie-authenticated
+`ws-ticket` mint through that same proxy, then the direct-to-API
+socket exactly as `lib/ws.ts` performs it — was verified with a
+scripted equivalent of that exact sequence instead of a literal
+DevTools check, and it connects successfully end to end. All 9
+existing proof scripts re-run with no regressions; `ruff check .`,
+frontend `ESLint`, `tsc --noEmit`, and a full `next build` all clean.

@@ -25,6 +25,7 @@ import {
   type TicketType,
   type WorkflowState,
 } from "../../../../lib/types";
+import { connectProjectSocket } from "../../../../lib/ws";
 
 // First two chars of the email's local part — no display-name field exists
 // on User yet, so email is the only identity data available to derive a
@@ -236,6 +237,38 @@ export default function ProjectBoardPage() {
       await load();
     })();
   }, [load]);
+
+  // Phase 2 slice 1: prove the connection itself, nothing more yet -- no
+  // pub/sub, no rendered state, just real connection-lifecycle logging so
+  // this is actually verifiable by hand in a browser, not just by reading
+  // the code. cancelled guards against the ticket fetch resolving after a
+  // fast unmount (e.g. navigating away before it returns), which would
+  // otherwise leak an open socket nothing is tracking anymore.
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const ws = await connectProjectSocket(projectId);
+      if (cancelled) {
+        ws?.close();
+        return;
+      }
+      if (!ws) {
+        console.warn("[ws] could not obtain a connection ticket");
+        return;
+      }
+      socket = ws;
+      ws.onopen = () => console.log("[ws] connected to project", projectId);
+      ws.onclose = (e) => console.log("[ws] closed", e.code, e.reason);
+      ws.onerror = () => console.log("[ws] error");
+    })();
+
+    return () => {
+      cancelled = true;
+      socket?.close();
+    };
+  }, [projectId]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
