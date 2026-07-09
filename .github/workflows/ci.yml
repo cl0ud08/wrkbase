@@ -240,14 +240,42 @@ jobs:
       - name: Reset rate limiter (websocket handshake)
         run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
 
-      # Phase 2 slice 1: the WebSocket handshake itself, not pub/sub (that
-      # doesn't exist yet). Four ways in are proven rejected at the
-      # handshake -- no ticket, an invalid ticket, a mismatched Origin
-      # (CSWSH), and a valid ticket for a project the caller's org can't
-      # reach -- plus a reused ticket (replay) and the real happy path,
-      # which also has to survive a short idle period and close cleanly.
+      # Phase 2 slice 1: the WebSocket handshake itself. Four ways in are
+      # proven rejected at the handshake -- no ticket, an invalid ticket, a
+      # mismatched Origin (CSWSH), and a valid ticket for a project the
+      # caller's org can't reach -- plus a reused ticket (replay) and the
+      # real happy path, which also has to survive a short idle period and
+      # close cleanly.
       - name: Verify WebSocket handshake auth
         run: python -m scripts.verify_ws
+
+      - name: Reset rate limiter (websocket pub/sub)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # A second, independent uvicorn process on a different port, sharing
+      # only Postgres and Redis with the one started above -- not a second
+      # copy for load, a deliberate test double. verify_ws_pubsub.py routes
+      # one WebSocket connection through this process and the mutating
+      # PATCH through the other; if the event still arrives, it travelled
+      # through Redis, not this job's one shared Python process's memory,
+      # which is the entire thing this proof exists to rule out.
+      - name: Start a second API process for the pub/sub fan-out proof
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8001 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8001/health && exit 0
+            sleep 1
+          done
+          echo "Second API process did not become healthy in time" >&2
+          exit 1
+
+      # Phase 2 slice 2: ticket-update events actually fan out over Redis
+      # pub/sub -- across the two separate processes above, not just within
+      # one -- confirmed via PUBSUB NUMSUB (not assumed) that a connection
+      # is a real subscriber and that a disconnect actually removes it, and
+      # that a mutation on an unrelated project is never received.
+      - name: Verify WebSocket pub/sub fan-out
+        run: python -m scripts.verify_ws_pubsub
 
       - name: Run pytest suite (if any test files exist yet)
         run: |
