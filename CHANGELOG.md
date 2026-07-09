@@ -2684,6 +2684,38 @@ race by construction instead of widening the timeout and hoping.
 Re-run clean afterward, including the cross-process fan-out check
 this script exists for in the first place.
 
+**That fix passed locally and then failed in CI — for a reason that
+mattered.** The local dry run of the exact CI wiring (stub server, two
+stub-pointed workers) passed cleanly, so the fix was pushed. CI's real
+run then hit a hard, deterministic timeout: `wait_until_triaged`
+waited the full 15 seconds and raised, because in CI at that point in
+the job, no worker exists yet at all — `ci.yml` only starts the stub
+server and the two worker processes right before the triage-specific
+proof, near the very end. Locally this never showed up because dev's
+`worker` Compose service is a normal, always-on service that had
+simply been running the whole time in the background, quietly
+draining the fixture tickets regardless of where in the script order
+they were created. The fix that worked locally relied on an assumption
+that happened to be true in dev and false in CI — worth stating
+plainly rather than glossing over, since "passed in my dry run" turned
+out not to be the same claim as "will pass in CI" here. The real fix:
+moved the stub-server and worker-startup steps in `ci.yml` from right
+before the triage-specific proof to right after the migrations step,
+so a real consumer is active for the entire rest of the job, not just
+the last few steps of it. This isn't just a workaround for the
+timeout — it's the more architecturally honest ordering, since
+`worker` genuinely is an always-on service everywhere else this app
+runs (local dev, and eventually production); CI had been the one
+environment quietly special-casing it to start late, and that's what
+made the earlier fix's assumption invisible until CI actually
+exercised it. Re-verified locally by reproducing the corrected order
+end to end — stopping the persistent dev worker, starting the stub and
+two stub-pointed workers immediately (before any proof script runs, as
+CI now does), then running `verify_tickets_rls`, `verify_sprints_rls`,
+`verify_ws_pubsub`, `verify_notifications`, and `verify_triage` in
+sequence — all clean, including `verify_ws_pubsub`'s drain resolving
+in well under a second against the stub instead of timing out.
+
 **Audited the other two ticket-creating proof scripts for the same
 exposure, rather than assuming the fix belonged in exactly one
 place.** `verify_notifications.py` creates a ticket as a fixture too

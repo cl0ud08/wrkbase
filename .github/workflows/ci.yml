@@ -160,6 +160,66 @@ jobs:
       - name: Run database migrations
         run: alembic upgrade head
 
+      # Started this early, not just before the triage-specific proof near
+      # the end of this job, because that's what exposed the actual bug:
+      # every ticket any proof script below creates enqueues a real async
+      # triage job the instant it's created (see worker/main.py), and with
+      # no consumer running yet, those jobs just pile up unconsumed until a
+      # worker finally starts near the end of this job -- which is exactly
+      # what verify_ws_pubsub.py's own fixture tickets hit. Its "a mutation
+      # on a different project is never received" check can only ever be
+      # correct if a real worker is either already fully caught up when the
+      # check runs, or draining fast enough that a fixture ticket's own
+      # belated completion event doesn't land in the middle of that check's
+      # listen window (see verify_ws_pubsub.py's wait_until_triaged for the
+      # deliberate drain). Starting the consumer here instead also just
+      # matches how this app actually runs outside CI: `worker` is a normal
+      # always-on Compose service, not something that switches on only for
+      # one proof script's benefit.
+      #
+      # Speaks just enough of Groq's and Gemini's real wire shape to
+      # satisfy their official SDKs' own response parsing, so the workers
+      # started below run their real code path (queue consume, prompt
+      # build, HTTP call via the real SDKs, response parsing, Pydantic
+      # validation, DB write, Redis publish) without this job costing API
+      # credits or being at the mercy of a live model's non-determinism on
+      # every single push. See scripts/_fake_llm_server.py's own docstring.
+      - name: Start fake LLM stub server
+        run: |
+          python -m scripts._fake_llm_server 9100 > /tmp/fake_llm.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9100/health && exit 0
+            sleep 1
+          done
+          echo "Fake LLM stub server did not become healthy in time" >&2
+          cat /tmp/fake_llm.log >&2
+          exit 1
+
+      # Two, not one: verify_triage.py's competing-consumers check needs a
+      # second real worker process actually competing for the same queue
+      # to mean anything — one worker processing everything correctly
+      # would look identical whether or not double-processing is possible.
+      # Logs redirected to a file and polled instead of a port/health
+      # endpoint (a queue consumer has neither) — found locally that
+      # rabbitmq's own healthcheck can report healthy slightly before the
+      # AMQP listener actually accepts connections, so connect_robust's
+      # first attempt can fail; by the time this step runs (well after
+      # the services block's own health gate), rabbitmq has had many
+      # other steps' worth of time to finish starting, which is the real
+      # fix — this loop is the fail-clearly backstop, not the fix itself.
+      - name: Start two worker processes for the triage proof
+        run: |
+          python -m worker.main > /tmp/worker1.log 2>&1 &
+          python -m worker.main > /tmp/worker2.log 2>&1 &
+          for i in $(seq 1 30); do
+            grep -q "worker started" /tmp/worker1.log 2>/dev/null && \
+              grep -q "worker started" /tmp/worker2.log 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "Workers did not start in time" >&2
+          cat /tmp/worker1.log /tmp/worker2.log >&2
+          exit 1
+
       - name: Seed dev data (verify_rls.py expects it)
         run: python -m scripts.seed
 
@@ -322,49 +382,6 @@ jobs:
 
       - name: Reset rate limiter (ticket triage)
         run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
-
-      # Speaks just enough of Groq's and Gemini's real wire shape to
-      # satisfy their official SDKs' own response parsing, so the workers
-      # started below run their real code path (queue consume, prompt
-      # build, HTTP call via the real SDKs, response parsing, Pydantic
-      # validation, DB write, Redis publish) without this job costing API
-      # credits or being at the mercy of a live model's non-determinism on
-      # every single push. See scripts/_fake_llm_server.py's own docstring.
-      - name: Start fake LLM stub server
-        run: |
-          python -m scripts._fake_llm_server 9100 > /tmp/fake_llm.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:9100/health && exit 0
-            sleep 1
-          done
-          echo "Fake LLM stub server did not become healthy in time" >&2
-          cat /tmp/fake_llm.log >&2
-          exit 1
-
-      # Two, not one: verify_triage.py's competing-consumers check needs a
-      # second real worker process actually competing for the same queue
-      # to mean anything — one worker processing everything correctly
-      # would look identical whether or not double-processing is possible.
-      # Logs redirected to a file and polled instead of a port/health
-      # endpoint (a queue consumer has neither) — found locally that
-      # rabbitmq's own healthcheck can report healthy slightly before the
-      # AMQP listener actually accepts connections, so connect_robust's
-      # first attempt can fail; by the time this step runs (well after
-      # the services block's own health gate), rabbitmq has had many
-      # other steps' worth of time to finish starting, which is the real
-      # fix — this loop is the fail-clearly backstop, not the fix itself.
-      - name: Start two worker processes for the triage proof
-        run: |
-          python -m worker.main > /tmp/worker1.log 2>&1 &
-          python -m worker.main > /tmp/worker2.log 2>&1 &
-          for i in $(seq 1 30); do
-            grep -q "worker started" /tmp/worker1.log 2>/dev/null && \
-              grep -q "worker started" /tmp/worker2.log 2>/dev/null && exit 0
-            sleep 1
-          done
-          echo "Workers did not start in time" >&2
-          cat /tmp/worker1.log /tmp/worker2.log >&2
-          exit 1
 
       # Phase 3 slice 1: pending_triage on creation, the worker's async
       # transition, the live update over the board's existing WebSocket
