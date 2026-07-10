@@ -54,11 +54,24 @@ back out of its own prompt text and echoes it into
 categories_addressed -- content the request itself already contains,
 not a hidden test-only signal.
 
+Sprint retro calls are a fourth branch, same idea again: distinguished
+by "agile coach writing a sprint retrospective", unique to
+sprint_retro.py's own system prompt. What's content-aware here isn't a
+category key but the completed/returned ticket *counts*
+sprint_retro.py's own prompt builder already writes into its own
+headers ("Completed tickets (N):", "Returned to backlog, not finished
+(N):") -- this stub reads those two numbers back out with a plain
+regex and reflects them into the fake narrative/highlights/notes/risks,
+so scripts/verify_sprint_retro.py can assert real, checkable behavior
+for the edge cases that matter (zero completed, zero returned) without
+needing any real language understanding to approximate.
+
 Run: python -m scripts._fake_llm_server [port]
 """
 
 import json
 import math
+import re
 import sys
 
 import uvicorn
@@ -138,10 +151,32 @@ def _fake_appsec_review_for(text: str) -> dict:
     }
 
 
+def _fake_sprint_retro_for(text: str) -> dict:
+    completed_match = re.search(r"completed tickets \((\d+)\)", text)
+    returned_match = re.search(r"returned to backlog, not finished \((\d+)\)", text)
+    completed_count = int(completed_match.group(1)) if completed_match else 0
+    returned_count = int(returned_match.group(1)) if returned_match else 0
+    return {
+        "narrative": (
+            f"Stub sprint retro: {completed_count} ticket(s) completed, "
+            f"{returned_count} ticket(s) returned to backlog."
+        ),
+        "completed_highlights": (
+            [f"Stub highlight covering {completed_count} completed ticket(s)."] if completed_count else []
+        ),
+        "incomplete_notes": (
+            [f"Stub note: {returned_count} ticket(s) returned to backlog."] if returned_count else []
+        ),
+        "risks": (["Stub risk flag: this sprint had tickets returned to the backlog."] if returned_count else []),
+    }
+
+
 def _fake_result_for(body: dict) -> dict:
     text = _prompt_text(body)
     if "application security reviewer" in text:
         return _fake_appsec_review_for(text)
+    if "agile coach writing a sprint retrospective" in text:
+        return _fake_sprint_retro_for(text)
     if "ticket-parsing assistant" not in text:
         return _FAKE_TRIAGE_RESULT
     if _LOW_CONFIDENCE_SENTINEL in text:

@@ -82,6 +82,104 @@ function Card({ ticket, ticketKey, draggable }: { ticket: Ticket; ticketKey: str
   );
 }
 
+function RetroSection({
+  title,
+  items,
+  emptyLabel,
+}: {
+  title: string;
+  items: string[] | null;
+  emptyLabel: string;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <h3 className="text-xs font-semibold tracking-wide text-ink-tertiary uppercase">{title}</h3>
+      {items && items.length > 0 ? (
+        <ul className="flex flex-col gap-1 text-sm text-ink-secondary">
+          {items.map((item, i) => (
+            <li key={i} className="flex gap-1.5">
+              <span aria-hidden="true">·</span>
+              <span>{item}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-sm text-ink-tertiary">{emptyLabel}</p>
+      )}
+    </div>
+  );
+}
+
+// Accent, not a semantic danger/warning color — same "AI touched this"
+// vocabulary as TriageIndicator/AppSecIndicator on the board page (see
+// apps/web/app/(shell)/projects/[projectId]/page.tsx), reused here
+// rather than forked. Only rendered for a completed sprint: retroStatus
+// is NULL for every planned/active sprint (see apps/api/app/db/models.py),
+// a real, permanent state, not a "loading" one.
+function SprintRetroPanel({
+  sprint,
+  onRegenerate,
+  regenerating,
+}: {
+  sprint: Sprint;
+  onRegenerate: () => void;
+  regenerating: boolean;
+}) {
+  if (sprint.status !== "completed" || !sprint.retroStatus) return null;
+
+  if (sprint.retroStatus === "pending") {
+    return (
+      <div className="flex items-center gap-1.5 rounded-md border border-line-subtle bg-surface-2 px-3 py-2.5 text-sm text-accent">
+        <span className="h-1.5 w-1.5 flex-shrink-0 animate-pulse rounded-full bg-accent" aria-hidden="true" />
+        Generating sprint retro…
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-line-subtle bg-surface-2 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <span className="rounded-sm bg-accent-subtle px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-accent uppercase">
+          AI sprint retro
+        </span>
+        <button
+          onClick={onRegenerate}
+          disabled={regenerating}
+          className="text-xs text-ink-tertiary underline transition-colors duration-100 hover:text-ink-secondary disabled:opacity-50"
+        >
+          Regenerate
+        </button>
+      </div>
+
+      {sprint.retroStatus === "failed" ? (
+        <p className="text-sm text-ink-tertiary" title={sprint.retroError ?? undefined}>
+          AI summary unavailable — the retro couldn&apos;t be generated this time. Try regenerating.
+        </p>
+      ) : (
+        <>
+          <p className="text-sm text-ink">{sprint.retroNarrative}</p>
+          <p className="font-mono text-xs text-ink-tertiary">
+            {sprint.totalPoints} / {sprint.pointsPlanned ?? sprint.totalPoints} pts completed
+          </p>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <RetroSection
+              title="What got done"
+              items={sprint.retroCompletedHighlights}
+              emptyLabel="Nothing completed this sprint."
+            />
+            <RetroSection
+              title="What didn't"
+              items={sprint.retroIncompleteNotes}
+              emptyLabel="Everything planned was finished."
+            />
+            <RetroSection title="Risks & blockers" items={sprint.retroRisks} emptyLabel="Nothing flagged." />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function DropZone({
   id,
   title,
@@ -140,6 +238,7 @@ export default function SprintPlanningPage() {
   const [backlogTickets, setBacklogTickets] = useState<Ticket[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
@@ -169,6 +268,21 @@ export default function SprintPlanningPage() {
       await Promise.all([load(), loadSprintTickets()]);
     })();
   }, [load, loadSprintTickets]);
+
+  // Simple polling, not a WebSocket subscription -- this page has no live
+  // room of its own (unlike the board page's ticket-update channel), and
+  // ending/regenerating a sprint is a rare, single-object, admin-only
+  // action, not worth standing up new pub/sub infrastructure for. Stops
+  // itself the moment retroStatus leaves "pending" -- re-fetching sprint
+  // state is what actually clears the pending state, which is what makes
+  // this effect re-run and see there's nothing left to poll for.
+  useEffect(() => {
+    if (sprint?.retroStatus !== "pending") return;
+    const interval = setInterval(() => {
+      void load();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [sprint?.retroStatus, load]);
 
   async function moveTicket(ticketId: string, targetSprintId: string | null) {
     setError(null);
@@ -231,6 +345,21 @@ export default function SprintPlanningPage() {
     setBusy(false);
   }
 
+  async function handleRegenerate() {
+    setError(null);
+    setRegenerating(true);
+    const res = await apiFetch(`/api/projects/${projectId}/sprints/${sprintId}/retro/regenerate`, {
+      method: "POST",
+    });
+    if (res.ok) {
+      await load();
+    } else {
+      const data = await res.json().catch(() => null);
+      setError(data?.detail ?? "Failed to regenerate sprint retro.");
+    }
+    setRegenerating(false);
+  }
+
   if (!sprint) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -285,6 +414,8 @@ export default function SprintPlanningPage() {
       {error && <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>}
 
       {sprint.goal && <p className="text-sm text-ink-secondary">{sprint.goal}</p>}
+
+      <SprintRetroPanel sprint={sprint} onRegenerate={handleRegenerate} regenerating={regenerating} />
 
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <div className="flex flex-1 flex-col gap-4 lg:flex-row">

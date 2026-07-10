@@ -54,6 +54,15 @@ class SprintStatus(str, enum.Enum):
     COMPLETED = "completed"
 
 
+class SprintRetroStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    # A real, distinct terminal outcome, same reasoning as
+    # AppSecReviewStatus.FAILED — both providers exhausted their retry
+    # budgets. The sprint stays completed either way; see worker/main.py.
+    FAILED = "failed"
+
+
 class NotificationType(str, enum.Enum):
     ASSIGNMENT = "assignment"
     INVITE_ACCEPTED = "invite_accepted"
@@ -282,6 +291,27 @@ class Sprint(Base):
     # full data-loss-bug story. Each entry:
     # {"ticket_number": int, "title": str, "story_points": int | None}.
     retro_returned_snapshot: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    # NULL for every planned/active sprint — a real, permanent state, not
+    # a transient "hasn't started yet." Set to PENDING in the same
+    # transaction complete_sprint uses to set status=COMPLETED, so a
+    # completed sprint is never observably NULL here. See
+    # app/services/sprint_retro.py and worker/main.py.
+    retro_status: Mapped[SprintRetroStatus | None] = mapped_column(
+        Enum(
+            SprintRetroStatus,
+            name="sprint_retro_status",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=True,
+    )
+    retro_narrative: Mapped[str | None] = mapped_column(String, nullable=True)
+    retro_completed_highlights: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    retro_incomplete_notes: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    retro_risks: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    # Set only when retro_status = 'failed'.
+    retro_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    retro_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Ticket(Base):

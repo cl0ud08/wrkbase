@@ -346,6 +346,11 @@ export function mapTicketUpdatedEvent(data: TicketUpdatedEventApiPayload): Ticke
 
 export type SprintStatus = "planned" | "active" | "completed";
 
+// pending/completed/failed — see apps/api/app/services/sprint_retro.py
+// and apps/api/worker/main.py. NULL only for a sprint that hasn't
+// completed yet (a real, permanent state, not a transient "not started").
+export type SprintRetroStatus = "pending" | "completed" | "failed";
+
 export interface Sprint {
   id: string;
   orgId: string;
@@ -361,7 +366,19 @@ export interface Sprint {
   // place that's guaranteed consistent with what a ticket list endpoint
   // would return at the same instant.
   totalPoints: number;
+  // Computed server-side, only once the sprint has completed (NULL
+  // before that — see apps/api/app/api/sprints.py's _points_planned):
+  // totalPoints (what finished) plus whatever was captured in the
+  // returned-ticket snapshot at the moment of completion.
+  pointsPlanned: number | null;
   createdAt: string;
+  retroStatus: SprintRetroStatus | null;
+  retroNarrative: string | null;
+  retroCompletedHighlights: string[] | null;
+  retroIncompleteNotes: string[] | null;
+  retroRisks: string[] | null;
+  retroError: string | null;
+  retroGeneratedAt: string | null;
 }
 
 interface SprintApiResponse {
@@ -374,7 +391,15 @@ interface SprintApiResponse {
   end_date: string;
   status: SprintStatus;
   total_points: number;
+  points_planned: number | null;
   created_at: string;
+  retro_status: SprintRetroStatus | null;
+  retro_narrative: string | null;
+  retro_completed_highlights: string[] | null;
+  retro_incomplete_notes: string[] | null;
+  retro_risks: string[] | null;
+  retro_error: string | null;
+  retro_generated_at: string | null;
 }
 
 export function mapSprint(data: SprintApiResponse): Sprint {
@@ -388,7 +413,15 @@ export function mapSprint(data: SprintApiResponse): Sprint {
     endDate: data.end_date,
     status: data.status,
     totalPoints: data.total_points,
+    pointsPlanned: data.points_planned,
     createdAt: data.created_at,
+    retroStatus: data.retro_status,
+    retroNarrative: data.retro_narrative,
+    retroCompletedHighlights: data.retro_completed_highlights,
+    retroIncompleteNotes: data.retro_incomplete_notes,
+    retroRisks: data.retro_risks,
+    retroError: data.retro_error,
+    retroGeneratedAt: data.retro_generated_at,
   };
 }
 

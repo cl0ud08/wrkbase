@@ -3287,3 +3287,180 @@ the ticket's own specifics (the JPG/PNG avatar, the Stripe invoice
 logo), an unrelated ticket never flags at all, and editing a trivial
 ticket into security-relevance triggers a real, correctly-merged
 review.
+
+---
+
+## Slice 31 — Phase 4, slice 1: the AI sprint summary agent, and a real
+data-loss bug it surfaced along the way
+
+**Built:** when a sprint completes, a structured retro is generated
+async — a short narrative, what got done, what didn't, and risk
+flags/notable blockers, sectioned rather than a wall of text
+(`app/services/sprint_retro.py`, via the same Groq-primary/Gemini-
+fallback `llm_client.py` triage, parsing, duplicate detection, and
+AppSec review all build on). Stored on the sprint row, never
+regenerated on view, with a manual regenerate action available. Surfaced
+on the sprint page as an accent-colored panel matching the existing
+AI-feature vocabulary, polling while generation is in flight.
+
+**A real data-loss bug, found while building this slice and fixed on
+its own, ahead of the feature.** `complete_sprint` (migration 0012) has
+always auto-returned unfinished tickets to the backlog with a bulk
+`UPDATE ... SET sprint_id = NULL`. That was, and still is, correct for
+what the sprints feature originally needed — unfinished work goes back
+to the backlog, immediately plannable again. Nobody noticed at the time
+that the UPDATE is also destructive in a way nothing downstream could
+ever recover from: once `sprint_id` is NULL, there is no remaining
+query that can ever again say "this ticket used to be on sprint X and
+didn't finish." A ticket that stayed in the sprint's terminal column
+keeps `sprint_id` pointing at that sprint forever, deliberately, for
+velocity history — a returned ticket got no equivalent. This was never
+a functional bug against anything the sprints feature itself needed;
+the backlog return worked, and still works, exactly as designed. It
+became a real bug the moment this slice needed to know what had been
+returned, and found that history had already been silently erased for
+every sprint ever completed before the fix — a correct-in-isolation
+change quietly breaking a later assumption it had no way to know about,
+the ordinary shape a latent data-loss bug takes. Fixed by capturing a
+snapshot (ticket number, title, story points) of exactly which tickets
+are about to be returned, before the bulk `UPDATE` runs, in the same
+transaction `complete_sprint` already uses (migration 0021,
+`retro_returned_snapshot`). Committed on its own, ahead of and
+independent of the retro feature: it stops the data loss regardless of
+whether anything ever reads the column, which is exactly why it's a fix
+and not a feature.
+
+**The data audit: what this app actually has to build a retro from,
+checked directly rather than assumed from the original roadmap.** The
+roadmap for this slice implicitly assumed a retro could draw on ticket
+state-change history — when a ticket moved into the sprint, how long it
+sat in progress. That data does not exist anywhere in this codebase.
+There is no audit/activity/event-log table at all, checked directly
+against every model in `app/db/models.py`, not inferred from its
+absence being unsurprising. `Ticket.updated_at` is a single blanket
+"last touched" timestamp covering any field change whatsoever — title,
+description, `workflow_state_id`, `sprint_id`, assignee, all the
+same column — not a per-transition record; there is no way to answer
+"when did this ticket enter this sprint" from anything this app
+persists. The two timestamp-shaped fields `Ticket` does have
+(`triaged_at`, `appsec_reviewed_at`) are narrow AI-pipeline fields with
+nothing to do with board or sprint movement. There is also still no
+ticket-comment or activity-log system — the same gap Slice 30's AppSec
+work already found and worked around — so there's no qualitative "what
+actually happened" input beyond each ticket's own title and story
+points, and where it ended up. Net result: the context bundle this
+slice builds (`app/services/sprint_retro_context.py`) is honestly
+thinner than the roadmap assumed — a structural summary of what
+finished and what didn't, by title and points, no timeline, no
+qualitative history — designed around what's real rather than padded
+out with fabricated structure to match an assumption that didn't
+survive contact with the actual schema.
+
+**Sync vs. async, reasoned fresh rather than assumed from precedent.**
+A user clicking "Complete sprint" could superficially resemble either
+of this app's two existing patterns — a single deliberate click,
+waiting for *something* to come back, the same shape as NL ticket
+parsing. But what actually decided sync-vs-async both previous times
+was never "is the user waiting" in the abstract; it was whether the
+*next thing the user needs to do* is gated on the result. NL parse is
+sync because the user cannot proceed — review, edit, submit — without
+the parsed fields; there is no version of that flow where returning
+immediately and filling the ticket in later makes sense. Ending a
+sprint has no such gate: the action the user actually wants (the sprint
+ends, unfinished work returns to the backlog, the board reflects it) is
+fully complete the instant `complete_sprint`'s own transaction commits,
+with nothing about a retro's content required to make that true or
+usable. Nobody is blocked on retro text to start the next sprint or
+re-plan the backlog; the retro is something read once, not a value the
+UI needs synchronously. That's async — the same conclusion
+triage/embedding/AppSec reached, but reasoned fresh on its own terms,
+plus one reason specific to this endpoint: `complete_sprint` is the one
+place in this app that mutates real planning state for a whole team in
+a single transaction, and coupling that to an LLM call's latency (or a
+provider outage) would mean a flaky external API could make ending a
+sprint itself slow or fail — a worse failure mode than a slow triage,
+because it blocks real team workflow rather than just delaying an
+enrichment.
+
+**A fourth, fully independent queue — the first job scoped to a
+Sprint, not a Ticket.** Decided the same way triage vs. embedding vs.
+AppSec was, not inherited by default: `SprintRetroJob` shares neither
+the other three's failure characteristics nor their trigger entity. An
+LLM outage failing a sprint retro has nothing to do with whether some
+ticket's triage, embedding, or AppSec review succeeded, so folding it
+into any existing queue would recreate the exact ack/nack coupling
+problem Slice 29 and Slice 30 already worked out — and unlike those
+three, this is also a different *kind* of job entirely: a different
+consumer (`Sprint`, not `Ticket`), a different payload shape, a
+different row to write the outcome onto. The job payload still stays
+"trigger, not snapshot" (`sprint_id`/`org_id` only), but for a narrower
+reason than `EmbedJob`/`AppSecJob`: the worker does *not* re-derive
+which tickets were returned from live ticket state, because by the
+time the job is consumed that information no longer exists there at
+all — it only exists because `complete_sprint` already persisted the
+returned-ticket snapshot onto the sprint row itself, in the same
+transaction that completed the sprint, before the job was even
+published. The worker re-reads the `Sprint` row fresh rather than
+trusting a payload-carried snapshot, same defense-in-depth instinct as
+everywhere else in this app — that row already has everything it needs.
+
+**No reopen path exists for a completed sprint — confirmed, not
+assumed, and it's what justifies store-once regeneration semantics.**
+`SprintUpdate` deliberately excludes `status` (see its own docstring in
+`app/schemas/sprint.py`, written back in the original sprints slice);
+`start_sprint` only accepts a `PLANNED` sprint, `complete_sprint` only
+accepts an `ACTIVE` one. There is no code path anywhere in this app
+that can move a sprint's status backward once it's `COMPLETED` —
+checked directly against every sprint-status transition in
+`app/api/sprints.py`, not assumed from the absence of an obvious
+"reopen" button. That means the set of tickets a completed sprint's
+retro is built from — `retro_returned_snapshot` plus whatever still
+points at `sprint_id` — is permanently frozen the moment
+`complete_sprint` commits; the underlying data can never invalidate a
+stored retro after the fact. What *can* still change post-completion is
+the sprint's own name/goal (`SprintUpdate` allows both regardless of
+status), which could leave a previously-generated retro's prose
+referencing a goal that's since been reworded — a real but cosmetic
+staleness, not a data problem, and not disproportionate enough to
+justify auto-regenerating (and re-paying for an LLM call) on every such
+edit. A manual regenerate endpoint covers it instead, guarded only
+against overlapping in-flight generation (rejecting a second regenerate
+call while `retro_status` is still `PENDING` with a 409) — not against
+staleness the underlying data can't actually have.
+
+**Extended the proof-script pattern.** `scripts/verify_sprint_retro.py`
+(CI-wired) covers tenant isolation (a job claiming the wrong `org_id`
+rejected, the real row untouched — the same cross-org poison-job check
+already proven for `TriageJob`/`EmbedJob`/`AppSecJob`), every edge case
+this slice's own spec named explicitly — a sprint with zero completed
+tickets, a sprint with exactly one ticket, a sprint where everything
+got auto-returned, and (added on top, belt-and-suspenders) a sprint
+with literally zero tickets ever assigned — asserting well-formed,
+non-crashing, non-garbage output for each rather than just "the
+mechanism runs," and the stored-not-regenerated behavior: two
+consecutive `GET`s return byte-identical retro content, a regenerate
+call is rejected for a non-completed sprint (400) and for a sprint
+already regenerating (409), and a successful regenerate produces a
+provably new `retro_generated_at`. The local LLM stub
+(`scripts/_fake_llm_server.py`) gained a fourth branch, distinguished
+the same content-aware way as the other three (a phrase unique to
+`sprint_retro.py`'s own system prompt) — but unlike AppSec's category-
+key echo, this stub reads the real completed/returned ticket *counts*
+straight out of the real prompt text `sprint_retro.py`'s own prompt
+builder writes, which is what makes the edge-case assertions above
+mean something rather than just exercising plumbing with an opaque
+fixed reply.
+
+**Verified:** the migration was split into two — `0021` (the
+`retro_returned_snapshot` bugfix alone) and `0022` (everything else) —
+and both were downgraded and re-applied from a clean state to confirm
+each stands on its own; all 17 CI-wired backend proof scripts pass,
+including the new `verify_sprint_retro.py` and a re-run of the
+pre-existing `verify_sprints_rls.py` as a regression check against the
+`complete_sprint` change; `ruff check .` clean; frontend `tsc --noEmit`
+and `ESLint` clean on the touched files. Run against the real dev stack
+(stub LLM server + a stub-pointed worker process substituted for the
+real one, then restored), not just described: every proof-script
+assertion above was actually executed and passed, including the
+points-planned-vs-done math for a mixed sprint (3 done / 7 planned)
+and the regenerate flow's new-timestamp check.

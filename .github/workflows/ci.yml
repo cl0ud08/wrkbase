@@ -442,6 +442,26 @@ jobs:
       - name: Verify AppSec triggers
         run: python -m scripts.verify_appsec_triggers
 
+      - name: Reset rate limiter (sprint retro)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 4 slice 1: the AI sprint summary agent. Same already-running
+      # stub/worker/API setup as the steps above -- the stub's sprint-retro
+      # response is deterministic but genuinely content-aware (it reads the
+      # real completed/returned ticket counts back out of the real prompt
+      # text, see scripts/_fake_llm_server.py), which is enough to prove
+      # complete_sprint's returned-ticket snapshot capture, the async retro
+      # job, the edge cases (zero completed, one ticket, zero tickets ever
+      # assigned) producing well-formed output rather than crashing or
+      # returning garbage, the stored-not-regenerated read path, the
+      # regenerate guard, and tenant isolation. Whether a real retro's prose
+      # is genuinely insightful, not just plumbing-correct, is a job for a
+      # future verify_sprint_retro_llm.py against the real API, run
+      # manually -- not this step's, the same split already established for
+      # triage, parsing, duplicate detection, and AppSec review.
+      - name: Verify sprint retro
+        run: python -m scripts.verify_sprint_retro
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then

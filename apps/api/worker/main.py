@@ -2,25 +2,27 @@
 first, Gemini as fallback — see app/services/llm_triage.py) to classify
 each ticket; ticket-embedding jobs, calling Gemini's embedding endpoint
 (see app/services/ticket_embedding.py) to generate and store a ticket's
-semantic-duplicate-detection vector; and AppSec-review jobs, calling an
-LLM (see app/services/appsec_review.py) to write a tailored security
-review comment for tickets a cheap, deterministic keyword gate has
-already flagged.
+semantic-duplicate-detection vector; AppSec-review jobs, calling an LLM
+(see app/services/appsec_review.py) to write a tailored security review
+comment for tickets a cheap, deterministic keyword gate has already
+flagged; and sprint-retro jobs, calling an LLM (see
+app/services/sprint_retro.py) to write a structured retrospective for a
+sprint that just completed.
 
 Run: python -m worker.main (see docker-compose.yml's worker service —
 same image and codebase as the api service, just a different command).
 
---- Three queues, three jobs, not one job doing everything -------------
+--- Four queues, four jobs, not one job doing everything ---------------
 
-Triage, embedding, and AppSec review are all async for the same reason:
-nobody is waiting on any of their results at ticket-creation time (see
-app/api/tickets.py's create_ticket, which publishes whichever jobs apply
-and returns immediately). That answers *whether* each one is a
-background job; it doesn't answer whether they should share a job with
-each other — a genuinely different question, decided by thinking
-through what combining them would actually cost, the same way it was
-for triage vs. embedding, and reapplied here rather than assumed to
-transfer automatically.
+Triage, embedding, AppSec review, and sprint retro are all async for the
+same reason: nobody is waiting on any of their results at the moment
+they're triggered (see app/api/tickets.py's create_ticket for the first
+three, app/api/sprints.py's complete_sprint for the fourth — each
+publishes whichever jobs apply and returns immediately). That answers
+*whether* each one is a background job; it doesn't answer whether they
+should share a job with each other — a genuinely different question,
+decided by thinking through what combining them would actually cost,
+reapplied fresh each time rather than assumed to transfer automatically.
 
 If AppSec review were folded into _process_job (triage) or
 _process_embed_job, the same coupling problem would recur: AppSec's own
@@ -29,26 +31,30 @@ embedding succeeded — different prompt, independent failure mode, no
 shared cause. A combined job would force one ack/nack decision to cover
 outcomes that don't share fate: nack-and-requeue on an AppSec hiccup
 would redundantly re-run an already-succeeded triage or embedding call,
-silently re-paying for LLM work nothing asked to redo. Three independent
-messages (TriageJob, EmbedJob, AppSecJob, one queue each) sidestep this
-exactly as before: each gets its own ack/nack lifecycle, its own retry
-budget, its own terminal-failure handling, and none of their outcomes
-have any bearing on each other's.
+silently re-paying for LLM work nothing asked to redo. Sprint retro adds
+a second, independent reason it can't share a queue with any of the
+other three even setting failure-coupling aside: it's the first job
+scoped to a Sprint, not a Ticket — a different consumer, a different
+payload shape, and a different row to write the outcome onto. Four
+independent messages (TriageJob, EmbedJob, AppSecJob, SprintRetroJob,
+one queue each) sidestep all of this: each gets its own ack/nack
+lifecycle, its own retry budget, its own terminal-failure handling, and
+none of their outcomes have any bearing on each other's.
 
-AppSec review does have one genuinely new property triage and embedding
-don't share, worth stating rather than glossing over: it's the first of
-the three that's *conditionally* published. TriageJob and EmbedJob go
-out for every single ticket, because every ticket genuinely needs a
-priority and an embedding. AppSecJob only goes out when
+AppSec review and sprint retro both share one property triage and
+embedding don't: they're *conditionally* published, not fired for every
+ticket/sprint unconditionally. TriageJob and EmbedJob go out for every
+single ticket, because every ticket genuinely needs a priority and an
+embedding. AppSecJob only goes out when
 app/services/appsec_triggers.match_triggers() already matched a
-category, synchronously, in the API request itself, before anything is
-published — most tickets have zero security surface and never publish
-one at all. That changes this queue's *traffic volume* relative to the
-other two; it does not change the separate-queue conclusion, since the
-coupling argument above is about what happens once a job exists, not
-about how often one gets created.
+category, synchronously, in the API request itself. SprintRetroJob only
+goes out when a sprint actually completes (a much rarer event than a
+ticket being created), and again on a manual regenerate. Neither
+changes the separate-queue conclusion — the coupling argument above is
+about what happens once a job exists, not about how often one gets
+created.
 
-All three still run in this one worker process, on three concurrent
+All four still run in this one worker process, on four concurrent
 consumer loops sharing one AMQP connection but separate channels (each
 with its own prefetch_count=1 QoS, so one queue's traffic can never
 starve another's fair share). There's no deployment-topology reason to
@@ -173,7 +179,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.db.models import AppSecReviewStatus, Ticket, TriageStatus
+from app.db.models import AppSecReviewStatus, Sprint, SprintRetroStatus, Ticket, TriageStatus
 from app.db.session import AsyncSessionLocal, set_tenant_context
 from app.services.appsec_review import AppSecReviewFailed, generate_appsec_review
 from app.services.appsec_triggers import match_triggers
@@ -181,11 +187,15 @@ from app.services.llm_triage import TriageFailed, triage_ticket
 from app.services.queue import (
     APPSEC_QUEUE_NAME,
     EMBED_QUEUE_NAME,
+    SPRINT_RETRO_QUEUE_NAME,
     TRIAGE_QUEUE_NAME,
     AppSecJob,
     EmbedJob,
+    SprintRetroJob,
     TriageJob,
 )
+from app.services.sprint_retro import SprintRetroFailed, generate_sprint_retro
+from app.services.sprint_retro_context import assemble_retro_context
 from app.services.ticket_embedding import EmbeddingFailed, generate_embedding
 from app.services.ticket_events import SYSTEM_ACTOR_ID, publish_ticket_update
 
@@ -374,18 +384,83 @@ async def _process_appsec_job(job: AppSecJob) -> None:
         )
 
 
+async def _process_sprint_retro_job(job: SprintRetroJob) -> None:
+    async with AsyncSessionLocal() as session:
+        await set_tenant_context(session, job.org_id)
+        result = await session.execute(select(Sprint).where(Sprint.id == job.sprint_id))
+        sprint = result.scalar_one_or_none()
+        if sprint is None:
+            # Same poison-message reasoning as _process_job above.
+            raise LookupError(
+                f"sprint {job.sprint_id} not found under org {job.org_id} — "
+                "already deleted, or a malformed/stale job"
+            )
+
+        # Reads retro_returned_snapshot straight off the row just looked
+        # up above, not re-derived — see
+        # app/services/sprint_retro_context.py's module docstring for why
+        # that snapshot, captured once by complete_sprint, is the only
+        # source for "what got returned" by the time this job runs.
+        context = await assemble_retro_context(session, sprint)
+
+        try:
+            retro, provider = await generate_sprint_retro(context)
+        except SprintRetroFailed as exc:
+            # A handled, terminal outcome, same shape as TriageFailed/
+            # AppSecReviewFailed above — the sprint stays completed
+            # either way (retro generation never reverses that; see
+            # app/api/sprints.py's complete_sprint), only the summary
+            # itself is visibly missing.
+            sprint.retro_status = SprintRetroStatus.FAILED
+            sprint.retro_error = str(exc)
+            sprint.retro_generated_at = datetime.now(timezone.utc)
+            await session.commit()
+            logger.error("sprint retro failed for sprint=%s: %s", sprint.id, exc)
+            return
+
+        sprint.retro_narrative = retro.narrative
+        sprint.retro_completed_highlights = retro.completed_highlights
+        sprint.retro_incomplete_notes = retro.incomplete_notes
+        sprint.retro_risks = retro.risks
+        sprint.retro_status = SprintRetroStatus.COMPLETED
+        sprint.retro_error = None
+        sprint.retro_generated_at = datetime.now(timezone.utc)
+        await session.commit()
+        logger.info(
+            "generated retro for sprint=%s org=%s via=%s completed=%d returned=%d",
+            sprint.id,
+            job.org_id,
+            provider,
+            len(context.completed),
+            len(context.returned),
+        )
+
+
+def _job_identifier(job: BaseModel) -> str:
+    # Every job model in this app carries exactly one of these two id
+    # fields depending on what it's scoped to (a ticket for the first
+    # three job types, a sprint for the fourth) — used only for log
+    # messages in the generic _consume loop below, which has no other
+    # way to know which one a given job_model has without importing each
+    # job class specifically.
+    ticket_id = getattr(job, "ticket_id", None)
+    if ticket_id is not None:
+        return f"ticket={ticket_id}"
+    return f"sprint={getattr(job, 'sprint_id', '?')}"
+
+
 async def _consume(
     queue: aio_pika.abc.AbstractQueue,
     job_model: type[TJob],
     process: Callable[[TJob], Awaitable[None]],
 ) -> None:
-    """Generic consume loop shared by all three queues — the ack/nack
+    """Generic consume loop shared by all four queues — the ack/nack
     shape (unparseable -> reject no requeue, LookupError -> poison
     message, reject no requeue, anything else -> transient, requeue,
-    success -> ack) is identical across triage, embedding, and AppSec
-    review jobs alike; only the job model and the processing function
-    differ. See main() for the three call sites, each on its own
-    channel.
+    success -> ack) is identical across triage, embedding, AppSec
+    review, and sprint retro jobs alike; only the job model and the
+    processing function differ. See main() for the four call sites, each
+    on its own channel.
     """
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
@@ -400,14 +475,14 @@ async def _consume(
                 await process(job)
             except LookupError:
                 logger.warning(
-                    "poison message for ticket=%s on %r, rejecting without requeue",
-                    job.ticket_id,
+                    "poison message for %s on %r, rejecting without requeue",
+                    _job_identifier(job),
                     queue.name,
                 )
                 await message.nack(requeue=False)
             except Exception:
                 logger.exception(
-                    "transient failure processing ticket=%s on %r, requeueing", job.ticket_id, queue.name
+                    "transient failure processing %s on %r, requeueing", _job_identifier(job), queue.name
                 )
                 await message.nack(requeue=True)
             else:
@@ -418,7 +493,7 @@ async def main() -> None:
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
     async with connection:
         # Separate channels, not just separate queues on one shared
-        # channel — see module docstring's "three queues, three jobs"
+        # channel — see module docstring's "four queues, four jobs"
         # section for why: each channel's own prefetch_count=1 QoS
         # applies independently, so a burst of traffic on any one queue
         # (or a slow LLM call) can never starve another's fair share of
@@ -426,21 +501,29 @@ async def main() -> None:
         triage_channel = await connection.channel()
         embed_channel = await connection.channel()
         appsec_channel = await connection.channel()
+        sprint_retro_channel = await connection.channel()
         await triage_channel.set_qos(prefetch_count=1)
         await embed_channel.set_qos(prefetch_count=1)
         await appsec_channel.set_qos(prefetch_count=1)
+        await sprint_retro_channel.set_qos(prefetch_count=1)
         triage_queue = await triage_channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
         embed_queue = await embed_channel.declare_queue(EMBED_QUEUE_NAME, durable=True)
         appsec_queue = await appsec_channel.declare_queue(APPSEC_QUEUE_NAME, durable=True)
+        sprint_retro_queue = await sprint_retro_channel.declare_queue(SPRINT_RETRO_QUEUE_NAME, durable=True)
 
         logger.info(
-            "worker started, consuming %r, %r, and %r", TRIAGE_QUEUE_NAME, EMBED_QUEUE_NAME, APPSEC_QUEUE_NAME
+            "worker started, consuming %r, %r, %r, and %r",
+            TRIAGE_QUEUE_NAME,
+            EMBED_QUEUE_NAME,
+            APPSEC_QUEUE_NAME,
+            SPRINT_RETRO_QUEUE_NAME,
         )
 
         await asyncio.gather(
             _consume(triage_queue, TriageJob, _process_job),
             _consume(embed_queue, EmbedJob, _process_embed_job),
             _consume(appsec_queue, AppSecJob, _process_appsec_job),
+            _consume(sprint_retro_queue, SprintRetroJob, _process_sprint_retro_job),
         )
 
 

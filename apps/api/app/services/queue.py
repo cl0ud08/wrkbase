@@ -1,7 +1,7 @@
-"""Ticket-triage, ticket-embedding, and AppSec-review job publishing.
-worker/main.py is the consumer for all three — see its module docstring
-for the ack/nack and tenant-context reasoning, and for why these are
-three separate queues rather than one job type doing everything.
+"""Ticket-triage, ticket-embedding, AppSec-review, and sprint-retro job
+publishing. worker/main.py is the consumer for all four — see its module
+docstring for the ack/nack and tenant-context reasoning, and for why each
+is its own queue rather than one job type doing everything.
 """
 
 import uuid
@@ -14,6 +14,7 @@ from app.core.config import settings
 TRIAGE_QUEUE_NAME = "ticket_triage"
 EMBED_QUEUE_NAME = "ticket_embedding"
 APPSEC_QUEUE_NAME = "ticket_appsec_review"
+SPRINT_RETRO_QUEUE_NAME = "sprint_retro"
 
 _connection: aio_pika.abc.AbstractRobustConnection | None = None
 _channel: aio_pika.abc.AbstractChannel | None = None
@@ -82,6 +83,38 @@ class AppSecJob(BaseModel):
     org_id: uuid.UUID
 
 
+class SprintRetroJob(BaseModel):
+    """Published once, synchronously, by complete_sprint the instant a
+    sprint transitions to COMPLETED (see app/api/sprints.py), and again
+    by the manual regenerate endpoint. Unlike TriageJob/EmbedJob/
+    AppSecJob, this is scoped to a Sprint, not a Ticket — a genuinely
+    different trigger entity and a different consumer, which is why it
+    gets its own queue rather than being folded into an existing one
+    (see worker/main.py's module docstring for the full "fourth
+    independent queue, not a variation on an existing one" reasoning).
+
+    Deliberately minimal — sprint_id/org_id only, the same "trigger, not
+    snapshot" shape as EmbedJob/AppSecJob — but for a narrower reason
+    than either: the worker does NOT re-derive which tickets were
+    returned to the backlog from live ticket state, because by the time
+    this job is consumed that information no longer exists there at all
+    (complete_sprint's bulk UPDATE already nulled sprint_id for every
+    returned ticket — see app/services/sprint_retro_context.py's own
+    docstring for why). What makes re-reading fresh from the DB safe
+    here anyway is that complete_sprint persists the one fact that can't
+    be reconstructed later — Sprint.retro_returned_snapshot — onto the
+    sprint row itself, in the same transaction that completes the
+    sprint, before this job is even published. The worker re-reads the
+    Sprint row fresh (never trusts a payload-carried snapshot, same
+    defense-in-depth instinct as everywhere else in this app), and that
+    row already has everything app/services/sprint_retro_context.py
+    needs.
+    """
+
+    sprint_id: uuid.UUID
+    org_id: uuid.UUID
+
+
 async def _get_channel() -> aio_pika.abc.AbstractChannel:
     """Lazily connects on first publish, then reuses the same connection
     for this process's remaining life — the same "just works when
@@ -103,6 +136,7 @@ async def _get_channel() -> aio_pika.abc.AbstractChannel:
         await _channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
         await _channel.declare_queue(EMBED_QUEUE_NAME, durable=True)
         await _channel.declare_queue(APPSEC_QUEUE_NAME, durable=True)
+        await _channel.declare_queue(SPRINT_RETRO_QUEUE_NAME, durable=True)
     return _channel
 
 
@@ -137,3 +171,7 @@ async def publish_embed_job(job: EmbedJob) -> None:
 
 async def publish_appsec_job(job: AppSecJob) -> None:
     await _publish(job, routing_key=APPSEC_QUEUE_NAME)
+
+
+async def publish_sprint_retro_job(job: SprintRetroJob) -> None:
+    await _publish(job, routing_key=SPRINT_RETRO_QUEUE_NAME)

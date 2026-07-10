@@ -3,7 +3,7 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.db.models import SprintStatus
+from app.db.models import SprintRetroStatus, SprintStatus
 
 
 class SprintCreate(BaseModel):
@@ -44,7 +44,21 @@ class SprintRead(BaseModel):
     # number this app doesn't model — this is the sum of what's actually
     # committed, so it gets the less overloaded name.
     total_points: int
+    # Computed, same as total_points — only meaningful once completed
+    # (before that nothing's been returned yet, so it would just equal
+    # total_points). See _points_planned in app/api/sprints.py.
+    points_planned: int | None
     created_at: datetime
+    # NULL until the sprint completes (see app/api/sprints.py's
+    # complete_sprint) — a completed sprint is never observably NULL
+    # here. See app/services/sprint_retro.py / worker/main.py.
+    retro_status: SprintRetroStatus | None
+    retro_narrative: str | None
+    retro_completed_highlights: list[str] | None
+    retro_incomplete_notes: list[str] | None
+    retro_risks: list[str] | None
+    retro_error: str | None
+    retro_generated_at: datetime | None
 
 
 class SprintAssignRequest(BaseModel):
