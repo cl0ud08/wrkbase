@@ -1,13 +1,14 @@
 """A local stand-in for Groq and Gemini, speaking just enough of each
 provider's real wire shape to satisfy their official SDKs' response
-parsing -- used so verify_triage.py and verify_ticket_parse.py (both
-CI-wired, run on every push) can exercise the *real* code paths end to
-end (queue consume or HTTP request, prompt building, HTTP call via the
-real SDKs, response parsing, Pydantic validation, DB write/API response)
-without paying for or depending on the real vendor APIs. See
-verify_triage.py's module docstring for the full reasoning on why this
-exists instead of either "call the real APIs in CI" or "mock the service
-functions at the Python level."
+parsing -- used so verify_triage.py, verify_ticket_parse.py, and
+verify_duplicate_detection.py (all CI-wired, run on every push) can
+exercise the *real* code paths end to end (queue consume or HTTP
+request, prompt building, HTTP call via the real SDKs, response parsing,
+Pydantic validation, DB write/API response) without paying for or
+depending on the real vendor APIs. See verify_triage.py's module
+docstring for the full reasoning on why this exists instead of either
+"call the real APIs in CI" or "mock the service functions at the Python
+level."
 
 Both AsyncGroq and genai.Client accept a plain base-URL override natively
 (this is standard SDK configuration, not a hook added for testing) --
@@ -24,10 +25,28 @@ within parse by a plainly-named sentinel
 ("stub_trigger_low_confidence") the proof script puts in its own
 deliberately-ambiguous test input, visible in both places, not hidden.
 
+Embeddings work the same way, but can't be content-aware about
+*meaning* the way a real embedding model is -- there's no real semantic
+understanding here to approximate cheaply. Instead, a small set of
+plainly-named sentinels map deterministically to a small set of fixed
+vectors, geometrically constructed so their cosine similarities are
+exactly known in advance (see _VECTOR_BASE/_VECTOR_NEAR/_VECTOR_FAR
+below): similarity(BASE, NEAR) = 0.9 (above SIMILARITY_THRESHOLD, a
+real match), similarity(BASE, FAR) = similarity(NEAR, FAR) = well below
+it (never a match). This tests the actual plumbing this app's own code
+is responsible for -- the pgvector query, its project/org scoping, the
+threshold comparison, re-embedding on edit -- deterministically and for
+free. It does NOT test whether Gemini's real embeddings actually
+capture ticket-text semantics well enough for SIMILARITY_THRESHOLD to
+mean anything in practice -- that's what
+scripts/tune_duplicate_threshold.py is for, against the real API,
+run manually.
+
 Run: python -m scripts._fake_llm_server [port]
 """
 
 import json
+import math
 import sys
 
 import uvicorn
@@ -97,6 +116,57 @@ def _fake_result_for(body: dict) -> dict:
     return _FAKE_PARSE_CONFIDENT
 
 
+# --- Deterministic embedding vectors ------------------------------------
+#
+# Two orthonormal basis vectors in 768-dim space (E1: first half all
+# equal, second half zero; E2: the reverse), so any vector built as
+# cos(theta)*E1 + sin(theta)*E2 is automatically unit length and has a
+# cosine similarity to E1 of exactly cos(theta) -- exact, provable
+# control over the similarity scripts/verify_duplicate_detection.py
+# needs, not an approximation.
+_DIM = 768
+_HALF = _DIM // 2
+
+
+def _e1() -> list[float]:
+    return [1.0 / math.sqrt(_HALF)] * _HALF + [0.0] * (_DIM - _HALF)
+
+
+def _e2() -> list[float]:
+    return [0.0] * _HALF + [1.0 / math.sqrt(_DIM - _HALF)] * (_DIM - _HALF)
+
+
+def _mix(theta: float) -> list[float]:
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return [cos_t * a + sin_t * b for a, b in zip(_e1(), _e2())]
+
+
+_VECTOR_BASE = _e1()  # similarity(BASE, BASE) = 1.0
+_VECTOR_NEAR = _mix(math.acos(0.9))  # similarity(BASE, NEAR) = 0.9 -- above SIMILARITY_THRESHOLD
+_VECTOR_FAR = _e2()  # similarity(BASE, FAR) = 0.0, similarity(NEAR, FAR) = ~0.436 -- both below it
+
+_EMBED_MARKERS = {
+    "stub_embed_near": _VECTOR_NEAR,
+    "stub_embed_far": _VECTOR_FAR,
+}
+
+
+def _fake_embedding_for(body: dict) -> list[float]:
+    # Real request shape (confirmed empirically): {"requests": [{"content":
+    # {"parts": [{"text": ...}]}, ...}]} -- batchEmbedContents always
+    # wraps even a single embed_content() call in a "requests" list.
+    parts: list[str] = []
+    for req in body.get("requests", []):
+        for part in req.get("content", {}).get("parts", []):
+            parts.append(part.get("text", ""))
+    text = " ".join(parts).lower()
+
+    for marker, vector in _EMBED_MARKERS.items():
+        if marker in text:
+            return vector
+    return _VECTOR_BASE
+
+
 @app.post("/openai/v1/chat/completions")
 async def groq_chat_completions(request: Request) -> JSONResponse:
     # The minimum subset of Groq's real response envelope AsyncGroq's own
@@ -121,11 +191,18 @@ async def groq_chat_completions(request: Request) -> JSONResponse:
 
 
 @app.post("/v1beta/models/{model_and_method:path}")
-async def gemini_generate_content(model_and_method: str, request: Request) -> JSONResponse:
-    # Same minimum-subset idea for Gemini's shape: candidates[0].content
-    # .parts[0].text is what genai's response.text property actually
-    # reads under the hood.
-    result = _fake_result_for(await request.json())
+async def gemini_models_endpoint(model_and_method: str, request: Request) -> JSONResponse:
+    body = await request.json()
+
+    if model_and_method.endswith(":batchEmbedContents"):
+        # The minimum subset genai's own response.embeddings[0].values
+        # parsing actually reads.
+        return JSONResponse({"embeddings": [{"values": _fake_embedding_for(body)}]})
+
+    # generateContent (chat) -- same minimum-subset idea: candidates[0]
+    # .content.parts[0].text is what genai's response.text property
+    # actually reads under the hood.
+    result = _fake_result_for(body)
     return JSONResponse(
         {
             "candidates": [

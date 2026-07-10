@@ -408,6 +408,24 @@ jobs:
       - name: Verify ticket parse
         run: python -m scripts.verify_ticket_parse
 
+      - name: Reset rate limiter (duplicate detection)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 3 slice 4: semantic duplicate detection via pgvector. Same
+      # already-running stub/worker/API setup as the two steps above --
+      # the stub's embedding responses are geometrically constructed
+      # deterministic vectors with exactly known cosine similarities
+      # (see scripts/_fake_llm_server.py), which is what lets this run
+      # in CI at all: there's no cheap way to approximate real semantic
+      # meaning, only the plumbing (pgvector query, its project/org
+      # scoping, the threshold comparison, re-embedding on edit) that
+      # this app's own code is actually responsible for. Whether the
+      # tuned threshold holds against real embeddings of real ticket
+      # text is scripts/tune_duplicate_threshold.py's job, against the
+      # real Gemini API, run manually -- not this step's.
+      - name: Verify duplicate detection
+        run: python -m scripts.verify_duplicate_detection
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
