@@ -274,6 +274,14 @@ class Sprint(Base):
         server_default=SprintStatus.PLANNED.value,
     )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+    # Captured synchronously by complete_sprint before its bulk UPDATE
+    # nulls out sprint_id for every returned ticket -- previously the
+    # only record of which tickets those were, silently destroyed the
+    # instant that UPDATE ran, for every sprint ever completed before
+    # this column existed. See migration 0021's own docstring for the
+    # full data-loss-bug story. Each entry:
+    # {"ticket_number": int, "title": str, "story_points": int | None}.
+    retro_returned_snapshot: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
 
 class Ticket(Base):

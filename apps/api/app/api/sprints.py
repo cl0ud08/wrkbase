@@ -1,3 +1,13 @@
+"""Sprint planning.
+
+complete_sprint's returned-ticket snapshot (see migration 0021 and its
+own docstring for the full story) fixes a real data-loss bug: the bulk
+UPDATE below that auto-returns unfinished tickets to the backlog was
+always silently destroying the only record of which tickets those were,
+for every sprint ever completed. Captured here, ahead of and independent
+of whatever eventually reads it.
+"""
+
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -275,6 +285,21 @@ async def complete_sprint(
     terminal_state_id = await _terminal_workflow_state_id(db, project_id)
     if terminal_state_id is not None:
         conditions.append(Ticket.workflow_state_id != terminal_state_id)
+
+    # Captured BEFORE the bulk UPDATE below, not after: once that UPDATE
+    # runs, sprint_id is NULL on every one of these tickets and there is
+    # no query that can ever again tell you they were on this sprint at
+    # all. This used to just happen with nothing capturing it first — see
+    # migration 0021's own docstring for the full data-loss-bug story
+    # this fixes.
+    returned_result = await db.execute(
+        select(Ticket.ticket_number, Ticket.title, Ticket.story_points).where(*conditions)
+    )
+    sprint.retro_returned_snapshot = [
+        {"ticket_number": number, "title": title, "story_points": points}
+        for number, title, points in returned_result.all()
+    ]
+
     await db.execute(update(Ticket).where(*conditions).values(sprint_id=None))
 
     sprint.status = SprintStatus.COMPLETED
