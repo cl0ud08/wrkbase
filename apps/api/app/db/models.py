@@ -39,6 +39,15 @@ class TriageStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class AppSecReviewStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    # A real, distinct terminal outcome, same reasoning as
+    # TriageStatus.FAILED — both providers exhausted their retry budgets.
+    # The ticket stays flagged either way; see worker/main.py.
+    FAILED = "failed"
+
+
 class SprintStatus(str, enum.Enum):
     PLANNED = "planned"
     ACTIVE = "active"
@@ -406,6 +415,40 @@ class Ticket(Base):
     # a core ticket attribute. 768 dimensions, not gemini-embedding-001's
     # own 3072 default — see migration 0019 for the full reasoning.
     embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)
+    # NULL for the vast majority of tickets — "no trigger category has
+    # ever matched" is a permanent, common state here, not a transient
+    # "hasn't started yet" the way triage_status's own pending is. Set to
+    # PENDING synchronously, deterministically, the instant a keyword
+    # match happens (app/api/tickets.py) — the flag itself never depends
+    # on the async LLM call succeeding, only appsec_comment does. See
+    # app/services/appsec_triggers.py for the trigger library and
+    # app/services/appsec_review.py for what the async job does with it.
+    appsec_review_status: Mapped[AppSecReviewStatus | None] = mapped_column(
+        Enum(
+            AppSecReviewStatus,
+            name="appsec_review_status",
+            create_type=False,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=True,
+    )
+    # Same array-not-JSONB-not-join-table reasoning as labels (migration
+    # 0018): a handful of fixed category keys with no independent
+    # identity. Set synchronously alongside appsec_review_status, never
+    # silently shrunk by a later edit — see update_ticket's own reasoning
+    # for why a flag is additive-only once raised.
+    appsec_categories: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    # The LLM-generated, ticket-specific security note -- NULL until
+    # appsec_review_status = 'completed'. No comment system exists in
+    # this app (checked directly, not assumed absent — same gap
+    # triage_reasoning already worked around in migration 0018) to
+    # attach this to instead, so it's a plain field on the ticket.
+    appsec_comment: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Set only when appsec_review_status = 'failed' — real visibility
+    # into why the AI-generated guidance is missing, not a reason to
+    # un-flag a real security concern the keyword gate already found.
+    appsec_review_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    appsec_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Invite(Base):

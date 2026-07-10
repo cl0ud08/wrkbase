@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthContext, get_current_auth
 from app.db.models import (
+    AppSecReviewStatus,
     NotificationType,
     Organization,
     Project,
@@ -26,8 +27,16 @@ from app.schemas.ticket_duplicate import (
     DuplicateCheckResponse,
 )
 from app.schemas.ticket_parse import TicketParseRequest
+from app.services.appsec_triggers import match_triggers
 from app.services.notifications import create_notification, publish_notification
-from app.services.queue import EmbedJob, TriageJob, publish_embed_job, publish_triage_job
+from app.services.queue import (
+    AppSecJob,
+    EmbedJob,
+    TriageJob,
+    publish_appsec_job,
+    publish_embed_job,
+    publish_triage_job,
+)
 from app.services.ticket_duplicates import find_possible_duplicates
 from app.services.ticket_embedding import EmbeddingFailed
 from app.services.ticket_events import publish_ticket_update
@@ -117,6 +126,38 @@ def _require_owner_or_admin(ticket: Ticket, auth: AuthContext) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the ticket's creator or an org admin can modify it",
         )
+
+
+def _apply_appsec_trigger(ticket: Ticket) -> bool:
+    """Runs the keyword gate (app/services/appsec_triggers.match_triggers)
+    against the ticket's current title/description and, if it matches,
+    flags the ticket synchronously — additive-only, mirroring EmbedJob's
+    own "never silently un-flag" discipline: a category already recorded
+    here is never removed just because a later edit's wording happens to
+    drop the matching keyword. Shared by both create_ticket and
+    update_ticket below, since the logic is identical either way: create
+    is just the special case where there's no existing state yet.
+
+    Returns True if a new AppSecJob is worth publishing — the first
+    match ever, or a genuinely new category beyond what's already
+    recorded — False if there's nothing new for the LLM to review (no
+    match at all, or the matched categories are already a subset of
+    what's already flagged).
+    """
+    matched = match_triggers(ticket.title, ticket.description)
+    if not matched:
+        return False
+
+    matched_keys = {c.key for c in matched}
+    existing_keys = set(ticket.appsec_categories or [])
+    is_first_match = ticket.appsec_review_status is None
+    has_new_category = not matched_keys.issubset(existing_keys)
+    if not is_first_match and not has_new_category:
+        return False
+
+    ticket.appsec_categories = sorted(existing_keys | matched_keys)
+    ticket.appsec_review_status = AppSecReviewStatus.PENDING
+    return True
 
 
 async def _validate_parent(
@@ -300,6 +341,14 @@ async def create_ticket(
         # omitted here — nothing synchronous happens with them at creation
         # time at all; see the publish below.
     )
+    # Cheap, synchronous, deterministic — no I/O, no LLM call. Sets
+    # appsec_review_status/appsec_categories on the object in memory,
+    # before it's ever inserted, so a flagged ticket's very first row
+    # already carries the flag; see _apply_appsec_trigger's own
+    # docstring for why this is the one field set synchronously while
+    # the tailored comment itself is async.
+    needs_appsec_review = _apply_appsec_trigger(ticket)
+
     db.add(ticket)
     await db.commit()
 
@@ -317,6 +366,12 @@ async def create_ticket(
     # and worker/main.py for why embedding generation is a genuinely
     # separate job from triage, not one more step folded into it.
     await publish_embed_job(EmbedJob(ticket_id=ticket.id, org_id=auth.org_id))
+    # Conditional, unlike the two publishes above: most tickets match no
+    # trigger category at all and never publish an AppSecJob — see
+    # AppSecJob's own docstring in queue.py for why that's the point,
+    # not an oversight.
+    if needs_appsec_review:
+        await publish_appsec_job(AppSecJob(ticket_id=ticket.id, org_id=auth.org_id))
 
     return ticket
 
@@ -563,6 +618,16 @@ async def update_ticket(
     for field, value in update_data.items():
         setattr(ticket, field, value)
 
+    # Only worth re-running the gate when title/description actually
+    # changed — nothing else in a PATCH could change what match_triggers
+    # sees. Same additive-only, first-match-or-new-category logic as
+    # creation (see _apply_appsec_trigger) — an edit that touches these
+    # fields without introducing new security-relevant wording is a
+    # no-op here, same as it is for EmbedJob just below.
+    needs_appsec_review = False
+    if "title" in update_data or "description" in update_data:
+        needs_appsec_review = _apply_appsec_trigger(ticket)
+
     new_assignee_id = update_data.get("assignee_id")
     notification = None
     if (
@@ -601,6 +666,8 @@ async def update_ticket(
     # description-touching PATCH with no ordering concerns.
     if "title" in update_data or "description" in update_data:
         await publish_embed_job(EmbedJob(ticket_id=ticket.id, org_id=auth.org_id))
+    if needs_appsec_review:
+        await publish_appsec_job(AppSecJob(ticket_id=ticket.id, org_id=auth.org_id))
 
     # Live-board fan-out: only the collaborative subset, even for a
     # request that also touched a content field in the same PATCH (the

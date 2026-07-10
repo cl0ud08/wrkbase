@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.db.models import TicketPriority, TicketType, TriageStatus
+from app.db.models import AppSecReviewStatus, TicketPriority, TicketType, TriageStatus
 
 
 class TicketCreate(BaseModel):
@@ -77,6 +77,17 @@ class TicketRead(BaseModel):
     # Set only when triage_status = 'failed'.
     triage_error: str | None
     triaged_at: datetime | None
+    # NULL for the vast majority of tickets — no trigger category has
+    # ever matched. Not settable via TicketCreate/TicketUpdate; set only
+    # by the keyword gate (app/services/appsec_triggers.py) and the
+    # async review worker. See app/services/appsec_review.py and
+    # migration 0020.
+    appsec_review_status: AppSecReviewStatus | None
+    appsec_categories: list[str] | None
+    appsec_comment: str | None
+    # Set only when appsec_review_status = 'failed'.
+    appsec_review_error: str | None
+    appsec_reviewed_at: datetime | None
     created_at: datetime
     updated_at: datetime
     # Not settable via TicketUpdate — only DELETE/{id}/restore touch this.

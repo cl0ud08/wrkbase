@@ -1,51 +1,63 @@
 """Consumes ticket-triage jobs off RabbitMQ, calling a real LLM (Groq
 first, Gemini as fallback — see app/services/llm_triage.py) to classify
-each ticket, and ticket-embedding jobs, calling Gemini's embedding
-endpoint (see app/services/ticket_embedding.py) to generate and store a
-ticket's semantic-duplicate-detection vector.
+each ticket; ticket-embedding jobs, calling Gemini's embedding endpoint
+(see app/services/ticket_embedding.py) to generate and store a ticket's
+semantic-duplicate-detection vector; and AppSec-review jobs, calling an
+LLM (see app/services/appsec_review.py) to write a tailored security
+review comment for tickets a cheap, deterministic keyword gate has
+already flagged.
 
 Run: python -m worker.main (see docker-compose.yml's worker service —
 same image and codebase as the api service, just a different command).
 
---- Two queues, two jobs, not one job doing both -----------------------
+--- Three queues, three jobs, not one job doing everything -------------
 
-Both triage and embedding are async for the same reason: nobody is
-waiting on either result at ticket-creation time (see app/api/tickets.py's
-create_ticket, which publishes both and returns immediately). That
-answers *whether* to use a background job for embedding, but not
-whether it should be the *same* job as triage — a genuinely different
-question, decided here by thinking through what folding them together
-would actually cost.
+Triage, embedding, and AppSec review are all async for the same reason:
+nobody is waiting on any of their results at ticket-creation time (see
+app/api/tickets.py's create_ticket, which publishes whichever jobs apply
+and returns immediately). That answers *whether* each one is a
+background job; it doesn't answer whether they should share a job with
+each other — a genuinely different question, decided by thinking
+through what combining them would actually cost, the same way it was
+for triage vs. embedding, and reapplied here rather than assumed to
+transfer automatically.
 
-If embedding generation were one more step inside _process_job, the two
-outcomes would be coupled in ways that don't reflect reality: triage
-succeeding or failing has nothing to do with whether the embedding call
-succeeds or fails — they hit different endpoints, different providers
-(Groq-then-Gemini for triage; Gemini only for embedding, since Groq has
-no embedding model at all — see ticket_embedding.py), with independent
-failure modes. A single combined job forces one ack/nack decision to
-cover both: nack-and-requeue on an embedding hiccup would redundantly
-re-run a triage call that already succeeded, silently paying for and
-re-triggering an LLM classification nothing asked to redo. Acking
-regardless of the embedding outcome would need its own internal
-partial-failure bookkeeping just to know a retry is still owed — real
-complexity, for two concerns that don't need to share fate at all.
-Two independent messages sidestep this entirely: each gets its own
-ack/nack lifecycle, its own retry budget, its own terminal-failure
-handling, and neither's outcome has any bearing on the other's.
+If AppSec review were folded into _process_job (triage) or
+_process_embed_job, the same coupling problem would recur: AppSec's own
+LLM call succeeding or failing has nothing to do with whether triage or
+embedding succeeded — different prompt, independent failure mode, no
+shared cause. A combined job would force one ack/nack decision to cover
+outcomes that don't share fate: nack-and-requeue on an AppSec hiccup
+would redundantly re-run an already-succeeded triage or embedding call,
+silently re-paying for LLM work nothing asked to redo. Three independent
+messages (TriageJob, EmbedJob, AppSecJob, one queue each) sidestep this
+exactly as before: each gets its own ack/nack lifecycle, its own retry
+budget, its own terminal-failure handling, and none of their outcomes
+have any bearing on each other's.
 
-That argues for two *jobs* (two queues, two independent message
-lifecycles) — it doesn't argue for two *services*. Both are still
-consumed by this one worker process, on two concurrent consumer loops
-sharing one AMQP connection but separate channels (each with its own
-prefetch_count=1 QoS, so one queue's traffic can never starve the
-other's fair share the way a single shared channel's QoS would). There's
-no deployment-topology reason to duplicate the container/image/Compose
-service just because the message *types* are independent — the
-independence that actually matters here is at the message level, not
-the process level, and duplicating infrastructure to express a
-distinction that doesn't need it would be the same kind of
-premature-abstraction mistake this app avoids elsewhere.
+AppSec review does have one genuinely new property triage and embedding
+don't share, worth stating rather than glossing over: it's the first of
+the three that's *conditionally* published. TriageJob and EmbedJob go
+out for every single ticket, because every ticket genuinely needs a
+priority and an embedding. AppSecJob only goes out when
+app/services/appsec_triggers.match_triggers() already matched a
+category, synchronously, in the API request itself, before anything is
+published — most tickets have zero security surface and never publish
+one at all. That changes this queue's *traffic volume* relative to the
+other two; it does not change the separate-queue conclusion, since the
+coupling argument above is about what happens once a job exists, not
+about how often one gets created.
+
+All three still run in this one worker process, on three concurrent
+consumer loops sharing one AMQP connection but separate channels (each
+with its own prefetch_count=1 QoS, so one queue's traffic can never
+starve another's fair share). There's no deployment-topology reason to
+duplicate the container/image/Compose service just because the message
+*types* are independent — the independence that actually matters here
+is at the message level, not the process level, and duplicating
+infrastructure to express a distinction that doesn't need it would be
+the same kind of premature-abstraction mistake this app avoids
+elsewhere.
 
 --- Ack/nack: what the library actually defaults to, and why that's not
     what's used here --------------------------------------------------
@@ -161,10 +173,19 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.db.models import Ticket, TriageStatus
+from app.db.models import AppSecReviewStatus, Ticket, TriageStatus
 from app.db.session import AsyncSessionLocal, set_tenant_context
+from app.services.appsec_review import AppSecReviewFailed, generate_appsec_review
+from app.services.appsec_triggers import match_triggers
 from app.services.llm_triage import TriageFailed, triage_ticket
-from app.services.queue import EMBED_QUEUE_NAME, TRIAGE_QUEUE_NAME, EmbedJob, TriageJob
+from app.services.queue import (
+    APPSEC_QUEUE_NAME,
+    EMBED_QUEUE_NAME,
+    TRIAGE_QUEUE_NAME,
+    AppSecJob,
+    EmbedJob,
+    TriageJob,
+)
 from app.services.ticket_embedding import EmbeddingFailed, generate_embedding
 from app.services.ticket_events import SYSTEM_ACTOR_ID, publish_ticket_update
 
@@ -279,17 +300,92 @@ async def _process_embed_job(job: EmbedJob) -> None:
         logger.info("embedded ticket=%s org=%s", ticket.id, job.org_id)
 
 
+async def _process_appsec_job(job: AppSecJob) -> None:
+    async with AsyncSessionLocal() as session:
+        await set_tenant_context(session, job.org_id)
+        result = await session.execute(select(Ticket).where(Ticket.id == job.ticket_id))
+        ticket = result.scalar_one_or_none()
+        if ticket is None:
+            # Same poison-message reasoning as _process_job above.
+            raise LookupError(
+                f"ticket {job.ticket_id} not found under org {job.org_id} — "
+                "already deleted, or a malformed/stale job"
+            )
+
+        # Re-run the keyword gate against the ticket's *current*
+        # title/description, never trusting AppSecJob's payload to say
+        # what matched — it doesn't even carry that (see AppSecJob's own
+        # docstring). If the ticket was edited between publish and
+        # consume such that nothing matches anymore, there's nothing to
+        # review; a previously-set flag is never silently cleared here
+        # either (see app/api/tickets.py's update_ticket for why a flag
+        # is additive-only), this just means this particular job has
+        # nothing new to add.
+        categories = match_triggers(ticket.title, ticket.description)
+        if not categories:
+            logger.info("appsec job for ticket=%s found no current trigger match, skipping", ticket.id)
+            return
+
+        try:
+            review, provider = await generate_appsec_review(ticket.title, ticket.description, categories)
+        except AppSecReviewFailed as exc:
+            # A handled, terminal outcome, same shape as TriageFailed —
+            # the ticket stays flagged (appsec_review_status/categories
+            # were already set synchronously at creation/edit time; see
+            # app/api/tickets.py) since the security concern itself is
+            # real and independent of whether the AI could produce
+            # tailored prose. Only the guidance is missing, visibly.
+            ticket.appsec_review_status = AppSecReviewStatus.FAILED
+            ticket.appsec_review_error = str(exc)
+            ticket.appsec_reviewed_at = datetime.now(timezone.utc)
+            await session.commit()
+            await publish_ticket_update(
+                project_id=ticket.project_id,
+                ticket_id=ticket.id,
+                changes={
+                    "appsec_review_status": ticket.appsec_review_status,
+                    "appsec_review_error": ticket.appsec_review_error,
+                },
+                updated_by=SYSTEM_ACTOR_ID,
+            )
+            logger.error("appsec review failed for ticket=%s: %s", ticket.id, exc)
+            return
+
+        ticket.appsec_review_status = AppSecReviewStatus.COMPLETED
+        ticket.appsec_comment = review.comment
+        ticket.appsec_reviewed_at = datetime.now(timezone.utc)
+        await session.commit()
+        await publish_ticket_update(
+            project_id=ticket.project_id,
+            ticket_id=ticket.id,
+            changes={
+                "appsec_review_status": ticket.appsec_review_status,
+                "appsec_comment": ticket.appsec_comment,
+                "appsec_reviewed_at": ticket.appsec_reviewed_at,
+            },
+            updated_by=SYSTEM_ACTOR_ID,
+        )
+        logger.info(
+            "appsec-reviewed ticket=%s org=%s via=%s categories=%s",
+            ticket.id,
+            job.org_id,
+            provider,
+            [c.key for c in categories],
+        )
+
+
 async def _consume(
     queue: aio_pika.abc.AbstractQueue,
     job_model: type[TJob],
     process: Callable[[TJob], Awaitable[None]],
 ) -> None:
-    """Generic consume loop shared by both queues — the ack/nack shape
-    (unparseable -> reject no requeue, LookupError -> poison message,
-    reject no requeue, anything else -> transient, requeue, success ->
-    ack) is identical for triage and embedding jobs alike; only the job
-    model and the processing function differ. See main() for the two
-    call sites, each on its own channel.
+    """Generic consume loop shared by all three queues — the ack/nack
+    shape (unparseable -> reject no requeue, LookupError -> poison
+    message, reject no requeue, anything else -> transient, requeue,
+    success -> ack) is identical across triage, embedding, and AppSec
+    review jobs alike; only the job model and the processing function
+    differ. See main() for the three call sites, each on its own
+    channel.
     """
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
@@ -322,23 +418,29 @@ async def main() -> None:
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
     async with connection:
         # Separate channels, not just separate queues on one shared
-        # channel — see module docstring's "two queues, two jobs" section
-        # for why: each channel's own prefetch_count=1 QoS applies
-        # independently, so a burst of embedding jobs (or a slow Gemini
-        # call) can never starve triage's fair share of this worker's
-        # attention, or vice versa.
+        # channel — see module docstring's "three queues, three jobs"
+        # section for why: each channel's own prefetch_count=1 QoS
+        # applies independently, so a burst of traffic on any one queue
+        # (or a slow LLM call) can never starve another's fair share of
+        # this worker's attention.
         triage_channel = await connection.channel()
         embed_channel = await connection.channel()
+        appsec_channel = await connection.channel()
         await triage_channel.set_qos(prefetch_count=1)
         await embed_channel.set_qos(prefetch_count=1)
+        await appsec_channel.set_qos(prefetch_count=1)
         triage_queue = await triage_channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
         embed_queue = await embed_channel.declare_queue(EMBED_QUEUE_NAME, durable=True)
+        appsec_queue = await appsec_channel.declare_queue(APPSEC_QUEUE_NAME, durable=True)
 
-        logger.info("worker started, consuming %r and %r", TRIAGE_QUEUE_NAME, EMBED_QUEUE_NAME)
+        logger.info(
+            "worker started, consuming %r, %r, and %r", TRIAGE_QUEUE_NAME, EMBED_QUEUE_NAME, APPSEC_QUEUE_NAME
+        )
 
         await asyncio.gather(
             _consume(triage_queue, TriageJob, _process_job),
             _consume(embed_queue, EmbedJob, _process_embed_job),
+            _consume(appsec_queue, AppSecJob, _process_appsec_job),
         )
 
 

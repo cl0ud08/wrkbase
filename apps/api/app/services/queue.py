@@ -1,7 +1,7 @@
-"""Ticket-triage and ticket-embedding job publishing. worker/main.py is
-the consumer for both — see its module docstring for the ack/nack and
-tenant-context reasoning, and for why these are two separate queues
-rather than one job type doing both.
+"""Ticket-triage, ticket-embedding, and AppSec-review job publishing.
+worker/main.py is the consumer for all three — see its module docstring
+for the ack/nack and tenant-context reasoning, and for why these are
+three separate queues rather than one job type doing everything.
 """
 
 import uuid
@@ -13,6 +13,7 @@ from app.core.config import settings
 
 TRIAGE_QUEUE_NAME = "ticket_triage"
 EMBED_QUEUE_NAME = "ticket_embedding"
+APPSEC_QUEUE_NAME = "ticket_appsec_review"
 
 _connection: aio_pika.abc.AbstractRobustConnection | None = None
 _channel: aio_pika.abc.AbstractChannel | None = None
@@ -56,6 +57,31 @@ class EmbedJob(BaseModel):
     org_id: uuid.UUID
 
 
+class AppSecJob(BaseModel):
+    """Published only when app/services/appsec_triggers.match_triggers()
+    already matched at least one category, synchronously, in the API
+    request itself (see app/api/tickets.py) — unlike TriageJob and
+    EmbedJob, which publish unconditionally for every ticket because
+    every ticket genuinely needs a priority and an embedding. Most
+    tickets have zero security surface, so most tickets never publish
+    an AppSecJob at all; the queue's traffic is naturally correlated
+    with "tickets that actually matched a trigger," not with ticket
+    volume itself.
+
+    Same "trigger, not snapshot" shape as EmbedJob and for the same
+    reason: carries only ticket_id/org_id, not the matched categories or
+    the ticket text. The worker re-runs match_triggers() itself against
+    the ticket's *current* title/description at process time — both to
+    stay correct if the ticket was edited again between publish and
+    consume, and as the same defense-in-depth instinct that already
+    governs a job's claimed org_id: this app never trusts a job payload
+    for something it can cheaply re-derive from the real row instead.
+    """
+
+    ticket_id: uuid.UUID
+    org_id: uuid.UUID
+
+
 async def _get_channel() -> aio_pika.abc.AbstractChannel:
     """Lazily connects on first publish, then reuses the same connection
     for this process's remaining life — the same "just works when
@@ -76,6 +102,7 @@ async def _get_channel() -> aio_pika.abc.AbstractChannel:
         # same arguments is a safe no-op, not an error.
         await _channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
         await _channel.declare_queue(EMBED_QUEUE_NAME, durable=True)
+        await _channel.declare_queue(APPSEC_QUEUE_NAME, durable=True)
     return _channel
 
 
@@ -106,3 +133,7 @@ async def publish_triage_job(job: TriageJob) -> None:
 
 async def publish_embed_job(job: EmbedJob) -> None:
     await _publish(job, routing_key=EMBED_QUEUE_NAME)
+
+
+async def publish_appsec_job(job: AppSecJob) -> None:
+    await _publish(job, routing_key=APPSEC_QUEUE_NAME)
