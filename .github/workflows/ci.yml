@@ -426,6 +426,22 @@ jobs:
       - name: Verify duplicate detection
         run: python -m scripts.verify_duplicate_detection
 
+      - name: Reset rate limiter (appsec review)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 3 slice 5: the AI Security Champion. Same already-running
+      # stub/worker/API setup as the steps above -- the keyword-gate
+      # accuracy checks need no LLM at all (pure Python, deterministic),
+      # and the plumbing checks (synchronous flag, async review, merge-
+      # on-edit, cross-org poison-job rejection) exercise the real code
+      # path with the stub's deterministic (but not semantically real)
+      # review comment. Whether a real comment is genuinely *tailored* to
+      # a specific ticket, not templated, is
+      # scripts/verify_appsec_review_llm.py's job, against the real
+      # Groq/Gemini APIs, run manually -- not this step's.
+      - name: Verify AppSec triggers
+        run: python -m scripts.verify_appsec_triggers
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then

@@ -1,14 +1,14 @@
 """A local stand-in for Groq and Gemini, speaking just enough of each
 provider's real wire shape to satisfy their official SDKs' response
-parsing -- used so verify_triage.py, verify_ticket_parse.py, and
-verify_duplicate_detection.py (all CI-wired, run on every push) can
-exercise the *real* code paths end to end (queue consume or HTTP
-request, prompt building, HTTP call via the real SDKs, response parsing,
-Pydantic validation, DB write/API response) without paying for or
-depending on the real vendor APIs. See verify_triage.py's module
-docstring for the full reasoning on why this exists instead of either
-"call the real APIs in CI" or "mock the service functions at the Python
-level."
+parsing -- used so verify_triage.py, verify_ticket_parse.py,
+verify_duplicate_detection.py, and verify_appsec_triggers.py (all
+CI-wired, run on every push) can exercise the *real* code paths end to
+end (queue consume or HTTP request, prompt building, HTTP call via the
+real SDKs, response parsing, Pydantic validation, DB write/API response)
+without paying for or depending on the real vendor APIs. See
+verify_triage.py's module docstring for the full reasoning on why this
+exists instead of either "call the real APIs in CI" or "mock the service
+functions at the Python level."
 
 Both AsyncGroq and genai.Client accept a plain base-URL override natively
 (this is standard SDK configuration, not a hook added for testing) --
@@ -41,6 +41,18 @@ capture ticket-text semantics well enough for SIMILARITY_THRESHOLD to
 mean anything in practice -- that's what
 scripts/tune_duplicate_threshold.py is for, against the real API,
 run manually.
+
+AppSec review calls are chat completions, the same wire shape as
+triage/parse, so they need no new route -- only a third branch in
+_fake_result_for, distinguished the same content-aware way as triage
+vs. parse ("application security reviewer" is unique to
+appsec_review.py's own system prompt). Which categories the real call
+asked about needs no sentinel either, unlike parse's confident/
+low-confidence split: appsec_review.py's prompt embeds each matched
+category as "### Label (key)", so this stub just reads the same key
+back out of its own prompt text and echoes it into
+categories_addressed -- content the request itself already contains,
+not a hidden test-only signal.
 
 Run: python -m scripts._fake_llm_server [port]
 """
@@ -92,6 +104,17 @@ _FAKE_PARSE_LOW_CONFIDENCE = {
 
 _LOW_CONFIDENCE_SENTINEL = "stub_trigger_low_confidence"
 
+# The category keys appsec_triggers.py actually defines -- appsec_review.py's
+# system prompt embeds each matched category as "### Label (key)", so
+# searching for "(key)" in the prompt text tells this stub exactly which
+# categories the real call asked about, with no sentinel needed: unlike
+# parse's confident/low-confidence split (a genuinely different semantic
+# outcome the stub can't derive from the input alone), which categories
+# were requested is already fully determined by the prompt's own content.
+_APPSEC_CATEGORY_KEYS = (
+    "file_upload", "auth_permission", "payment_pii", "external_api", "admin_permission",
+)
+
 
 def _prompt_text(body: dict) -> str:
     # Groq/OpenAI-compatible shape: {"messages": [{"role": ..., "content": ...}, ...]}.
@@ -107,8 +130,18 @@ def _prompt_text(body: dict) -> str:
     return " ".join(parts).lower()
 
 
+def _fake_appsec_review_for(text: str) -> dict:
+    matched = [key for key in _APPSEC_CATEGORY_KEYS if f"({key})" in text]
+    return {
+        "comment": f"Stub deterministic security review covering: {', '.join(matched) or 'none'}.",
+        "categories_addressed": matched,
+    }
+
+
 def _fake_result_for(body: dict) -> dict:
     text = _prompt_text(body)
+    if "application security reviewer" in text:
+        return _fake_appsec_review_for(text)
     if "ticket-parsing assistant" not in text:
         return _FAKE_TRIAGE_RESULT
     if _LOW_CONFIDENCE_SENTINEL in text:
