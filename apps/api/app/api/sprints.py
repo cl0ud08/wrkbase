@@ -71,6 +71,7 @@ genuinely transient this time.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import exists, func, select, update
@@ -90,6 +91,7 @@ from app.db.models import (
 from app.db.session import get_db
 from app.schemas.sprint import SprintAssignRequest, SprintCreate, SprintRead, SprintUpdate
 from app.schemas.ticket import TicketRead
+from app.services.at_risk import assess_ticket_risk, workflow_state_bounds
 from app.services.queue import SprintRetroJob, publish_sprint_retro_job
 
 router = APIRouter(prefix="/projects/{project_id}/sprints", tags=["sprints"])
@@ -166,9 +168,42 @@ def _points_planned(sprint: Sprint) -> int | None:
     return sprint.total_points + returned_points  # type: ignore[attr-defined]
 
 
+async def _at_risk_count(db: AsyncSession, sprint: Sprint) -> int | None:
+    # NULL for a planned/completed sprint -- see app/services/at_risk.py's
+    # module docstring for why a risk assessment only means anything
+    # relative to the ONE currently-active sprint's own deadline. Short-
+    # circuits before any query for every non-active sprint, so calling
+    # this for every sprint in a list (see _with_total_points_many) costs
+    # nothing extra beyond the at-most-one active sprint actually present.
+    if sprint.status != SprintStatus.ACTIVE:
+        return None
+    tickets_result = await db.execute(
+        select(Ticket).where(Ticket.sprint_id == sprint.id, Ticket.deleted_at.is_(None))
+    )
+    tickets = list(tickets_result.scalars().all())
+    if not tickets:
+        return 0
+    earliest_state_id, terminal_state_id = await workflow_state_bounds(db, sprint.project_id)
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    return sum(
+        1
+        for ticket in tickets
+        if assess_ticket_risk(
+            ticket,
+            sprint_end_date=sprint.end_date,
+            today=today,
+            now=now,
+            earliest_state_id=earliest_state_id,
+            terminal_state_id=terminal_state_id,
+        ).at_risk
+    )
+
+
 async def _with_total_points(db: AsyncSession, sprint: Sprint) -> Sprint:
     sprint.total_points = await _total_points(db, sprint.id)  # type: ignore[attr-defined]
     sprint.points_planned = _points_planned(sprint)  # type: ignore[attr-defined]
+    sprint.at_risk_count = await _at_risk_count(db, sprint)  # type: ignore[attr-defined]
     return sprint
 
 
@@ -177,7 +212,10 @@ async def _with_total_points_many(db: AsyncSession, sprints: list[Sprint]) -> li
         return sprints
     # One grouped query for every sprint on the page, not one query per
     # sprint — the same N+1 concern _next_position/_validate_* helpers
-    # elsewhere in this app are written to avoid.
+    # elsewhere in this app are written to avoid. (at_risk_count doesn't
+    # get the same batching -- see _at_risk_count's own comment on why
+    # that's fine: it's a no-op query for every sprint except the one
+    # that's actually active.)
     result = await db.execute(
         select(Ticket.sprint_id, func.coalesce(func.sum(Ticket.story_points), 0))
         .where(Ticket.sprint_id.in_([s.id for s in sprints]), Ticket.deleted_at.is_(None))
@@ -187,6 +225,7 @@ async def _with_total_points_many(db: AsyncSession, sprints: list[Sprint]) -> li
     for sprint in sprints:
         sprint.total_points = int(totals.get(sprint.id, 0))  # type: ignore[attr-defined]
         sprint.points_planned = _points_planned(sprint)  # type: ignore[attr-defined]
+        sprint.at_risk_count = await _at_risk_count(db, sprint)  # type: ignore[attr-defined]
     return sprints
 
 

@@ -48,6 +48,13 @@ class SprintRead(BaseModel):
     # (before that nothing's been returned yet, so it would just equal
     # total_points). See _points_planned in app/api/sprints.py.
     points_planned: int | None
+    # Computed at read time, never stored — see app/services/at_risk.py's
+    # module docstring for why this whole feature has no schema, queue,
+    # or scheduler of its own. NULL for a planned/completed sprint (risk
+    # is only meaningful for the one currently ACTIVE sprint); a real
+    # count, possibly 0, for the active one. See _at_risk_count in
+    # app/api/sprints.py.
+    at_risk_count: int | None
     created_at: datetime
     # NULL until the sprint completes (see app/api/sprints.py's
     # complete_sprint) — a completed sprint is never observably NULL

@@ -28,6 +28,7 @@ from app.schemas.ticket_duplicate import (
 )
 from app.schemas.ticket_parse import TicketParseRequest
 from app.services.appsec_triggers import match_triggers
+from app.services.at_risk import assess_ticket_risk, find_active_sprint, workflow_state_bounds
 from app.services.notifications import create_notification, publish_notification
 from app.services.queue import (
     AppSecJob,
@@ -279,6 +280,45 @@ async def _next_position(db: AsyncSession, workflow_state_id: uuid.UUID) -> floa
     return (max_position or 0.0) + 1024.0
 
 
+async def _attach_risk(db: AsyncSession, project_id: uuid.UUID, tickets: list[Ticket]) -> None:
+    """Bolts at_risk/at_risk_reasons onto each ticket in place -- the
+    same runtime-attribute pattern as Sprint.total_points, computed
+    fresh every call and never persisted (see app/services/at_risk.py's
+    own module docstring for why nothing here is stored, queued, or
+    scheduled). NULL/None for every ticket not currently in the
+    project's active sprint, since a risk assessment is only meaningful
+    relative to an active sprint's own deadline -- a backlog ticket or
+    one in a planned/completed sprint has no deadline to be at risk
+    against.
+    """
+    active_sprint = await find_active_sprint(db, project_id)
+    if active_sprint is None:
+        for ticket in tickets:
+            ticket.at_risk = None  # type: ignore[attr-defined]
+            ticket.at_risk_reasons = None  # type: ignore[attr-defined]
+        return
+
+    earliest_state_id, terminal_state_id = await workflow_state_bounds(db, project_id)
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    for ticket in tickets:
+        if ticket.sprint_id != active_sprint.id:
+            ticket.at_risk = None  # type: ignore[attr-defined]
+            ticket.at_risk_reasons = None  # type: ignore[attr-defined]
+            continue
+        assessment = assess_ticket_risk(
+            ticket,
+            sprint_end_date=active_sprint.end_date,
+            today=today,
+            now=now,
+            earliest_state_id=earliest_state_id,
+            terminal_state_id=terminal_state_id,
+        )
+        ticket.at_risk = assessment.at_risk  # type: ignore[attr-defined]
+        ticket.at_risk_reasons = assessment.reasons  # type: ignore[attr-defined]
+
+
 async def _next_ticket_number(db: AsyncSession, org_id: uuid.UUID) -> int:
     # Atomic increment-and-fetch in one statement: Postgres serializes
     # concurrent UPDATEs to the same row automatically, so two tickets
@@ -499,7 +539,9 @@ async def list_tickets(
         .where(Ticket.project_id == project_id, Ticket.deleted_at.is_(None))
         .order_by(Ticket.created_at)
     )
-    return list(result.scalars().all())
+    tickets = list(result.scalars().all())
+    await _attach_risk(db, project_id, tickets)
+    return tickets
 
 
 @router.get("/tree", response_model=list[TicketTreeNode])
@@ -576,7 +618,9 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db),
 ) -> Ticket:
     await _get_project_or_404(db, project_id)
-    return await _get_ticket_or_404(db, project_id, ticket_id)
+    ticket = await _get_ticket_or_404(db, project_id, ticket_id)
+    await _attach_risk(db, project_id, [ticket])
+    return ticket
 
 
 @router.patch("/{ticket_id}", response_model=TicketRead)

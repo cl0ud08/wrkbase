@@ -92,6 +92,17 @@ class TicketRead(BaseModel):
     updated_at: datetime
     # Not settable via TicketUpdate — only DELETE/{id}/restore touch this.
     deleted_at: datetime | None
+    # Computed at read time, never stored (see app/services/at_risk.py's
+    # module docstring for why no column/queue/schedule exists for this
+    # at all) — NULL for every ticket not currently in its project's
+    # active sprint, since risk is only meaningful relative to an active
+    # sprint's own deadline. Only actually computed by
+    # app/api/tickets.py's list_tickets/get_ticket; every other
+    # TicketRead response (create/update/backlog/tree/assign) leaves
+    # these at their default of NULL rather than paying for the extra
+    # queries on a response the frontend re-fetches from anyway.
+    at_risk: bool | None = None
+    at_risk_reasons: list[str] | None = None
 
 
 class TicketTreeNode(TicketRead):
