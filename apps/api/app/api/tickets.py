@@ -20,9 +20,16 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.schemas.ticket import TicketCreate, TicketPage, TicketRead, TicketTreeNode, TicketUpdate
+from app.schemas.ticket_duplicate import (
+    DuplicateCandidate,
+    DuplicateCheckRequest,
+    DuplicateCheckResponse,
+)
 from app.schemas.ticket_parse import TicketParseRequest
 from app.services.notifications import create_notification, publish_notification
-from app.services.queue import TriageJob, publish_triage_job
+from app.services.queue import EmbedJob, TriageJob, publish_embed_job, publish_triage_job
+from app.services.ticket_duplicates import find_possible_duplicates
+from app.services.ticket_embedding import EmbeddingFailed
 from app.services.ticket_events import publish_ticket_update
 from app.services.ticket_parse import (
     ParsedTicketCandidate,
@@ -305,8 +312,61 @@ async def create_ticket(
             ticket_id=ticket.id, org_id=auth.org_id, title=ticket.title, description=ticket.description
         )
     )
+    # Same fire-and-forget reasoning as the triage job above, on its own
+    # separate queue -- see app/services/queue.py's EmbedJob docstring
+    # and worker/main.py for why embedding generation is a genuinely
+    # separate job from triage, not one more step folded into it.
+    await publish_embed_job(EmbedJob(ticket_id=ticket.id, org_id=auth.org_id))
 
     return ticket
+
+
+# Synchronous, same "is there a waiting caller" reasoning as parse_ticket
+# below -- a user reviewing a draft ticket (either the plain form or the
+# NL-parse review step) is deciding right now whether to create it, and
+# a duplicate warning only helps if it's part of that decision, not
+# discovered after the ticket already exists. Generates one throwaway
+# embedding for the draft text and compares it against other tickets'
+# already-stored embeddings (populated by the async EmbedJob above,
+# whenever those tickets were themselves created or last edited) --
+# nothing here is written to the database. See
+# app/services/ticket_duplicates.py for the query itself, the
+# project-scoping reasoning, and the empirically-tuned threshold.
+@router.post("/check-duplicates", response_model=DuplicateCheckResponse)
+async def check_duplicates(
+    project_id: uuid.UUID,
+    payload: DuplicateCheckRequest,
+    auth: AuthContext = Depends(get_current_auth),
+    db: AsyncSession = Depends(get_db),
+) -> DuplicateCheckResponse:
+    await _get_project_or_404(db, project_id)
+
+    try:
+        matches = await find_possible_duplicates(
+            db, project_id=project_id, title=payload.title, description=payload.description
+        )
+    except EmbeddingFailed as exc:
+        # Real provider failure, not "nothing matched" -- same 503-vs-200
+        # distinction already established for ticket parsing. Nothing
+        # was created either way; this just tells the frontend it's
+        # worth retrying, not that the draft itself is the problem.
+        logger.error("duplicate check unavailable for project=%s: %s", project_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Couldn't check for duplicates right now. Try again, or just create the ticket.",
+        ) from exc
+
+    return DuplicateCheckResponse(
+        matches=[
+            DuplicateCandidate(
+                ticket_id=m.ticket.id,
+                ticket_number=m.ticket.ticket_number,
+                title=m.ticket.title,
+                similarity=m.similarity,
+            )
+            for m in matches
+        ]
+    )
 
 
 # Synchronous, not published to RabbitMQ like the triage job above: a user
@@ -527,6 +587,20 @@ async def update_ticket(
 
     if notification is not None:
         await publish_notification(notification)
+
+    # A stale embedding is a silent-gap class of bug -- a ticket whose
+    # title/description changed but whose stored vector still describes
+    # the old text would keep matching (or failing to match) based on
+    # words that aren't even on the ticket anymore, and nothing about
+    # that is visible anywhere. Re-publishing EmbedJob here is the exact
+    # same trigger creation already fires, on the exact same queue,
+    # picked up by the exact same worker code -- regenerating an
+    # embedding isn't a distinct operation from generating one the first
+    # time, just the same one happening again. See EmbedJob's own
+    # docstring for why it's safe to fire this on every title/
+    # description-touching PATCH with no ordering concerns.
+    if "title" in update_data or "description" in update_data:
+        await publish_embed_job(EmbedJob(ticket_id=ticket.id, org_id=auth.org_id))
 
     # Live-board fan-out: only the collaborative subset, even for a
     # request that also touched a content field in the same PATCH (the

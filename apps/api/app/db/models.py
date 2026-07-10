@@ -2,6 +2,7 @@ import enum
 import uuid
 from datetime import date, datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import Date, DateTime, Enum, FetchedValue, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -393,6 +394,18 @@ class Ticket(Base):
     # time a ticket's deleted_at is actually set, it's guaranteed to have
     # no visible children left to orphan in the /tree view.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Nullable: populated asynchronously after creation (and regenerated
+    # after an edit that changes title/description) by the embed worker
+    # — see app/services/queue.py's EmbedJob and worker/main.py. NULL
+    # simply means "not embedded yet, or embedding generation failed" —
+    # such a ticket can never itself surface as a match for someone
+    # else's duplicate check (nothing to compare against) and is silently
+    # excluded from a check run *against* it, not a visible error state
+    # the way triage_status=failed is; see app/services/ticket_embedding.py
+    # for why duplicate detection is treated as a supporting feature, not
+    # a core ticket attribute. 768 dimensions, not gemini-embedding-001's
+    # own 3072 default — see migration 0019 for the full reasoning.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)
 
 
 class Invite(Base):

@@ -1,9 +1,51 @@
 """Consumes ticket-triage jobs off RabbitMQ, calling a real LLM (Groq
 first, Gemini as fallback — see app/services/llm_triage.py) to classify
-each ticket.
+each ticket, and ticket-embedding jobs, calling Gemini's embedding
+endpoint (see app/services/ticket_embedding.py) to generate and store a
+ticket's semantic-duplicate-detection vector.
 
 Run: python -m worker.main (see docker-compose.yml's worker service —
 same image and codebase as the api service, just a different command).
+
+--- Two queues, two jobs, not one job doing both -----------------------
+
+Both triage and embedding are async for the same reason: nobody is
+waiting on either result at ticket-creation time (see app/api/tickets.py's
+create_ticket, which publishes both and returns immediately). That
+answers *whether* to use a background job for embedding, but not
+whether it should be the *same* job as triage — a genuinely different
+question, decided here by thinking through what folding them together
+would actually cost.
+
+If embedding generation were one more step inside _process_job, the two
+outcomes would be coupled in ways that don't reflect reality: triage
+succeeding or failing has nothing to do with whether the embedding call
+succeeds or fails — they hit different endpoints, different providers
+(Groq-then-Gemini for triage; Gemini only for embedding, since Groq has
+no embedding model at all — see ticket_embedding.py), with independent
+failure modes. A single combined job forces one ack/nack decision to
+cover both: nack-and-requeue on an embedding hiccup would redundantly
+re-run a triage call that already succeeded, silently paying for and
+re-triggering an LLM classification nothing asked to redo. Acking
+regardless of the embedding outcome would need its own internal
+partial-failure bookkeeping just to know a retry is still owed — real
+complexity, for two concerns that don't need to share fate at all.
+Two independent messages sidestep this entirely: each gets its own
+ack/nack lifecycle, its own retry budget, its own terminal-failure
+handling, and neither's outcome has any bearing on the other's.
+
+That argues for two *jobs* (two queues, two independent message
+lifecycles) — it doesn't argue for two *services*. Both are still
+consumed by this one worker process, on two concurrent consumer loops
+sharing one AMQP connection but separate channels (each with its own
+prefetch_count=1 QoS, so one queue's traffic can never starve the
+other's fair share the way a single shared channel's QoS would). There's
+no deployment-topology reason to duplicate the container/image/Compose
+service just because the message *types* are independent — the
+independence that actually matters here is at the message level, not
+the process level, and duplicating infrastructure to express a
+distinction that doesn't need it would be the same kind of
+premature-abstraction mistake this app avoids elsewhere.
 
 --- Ack/nack: what the library actually defaults to, and why that's not
     what's used here --------------------------------------------------
@@ -112,19 +154,24 @@ transient failure — a DB hiccup, a network blip — deserves a requeue.
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Awaitable, Callable, TypeVar
 
 import aio_pika
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.models import Ticket, TriageStatus
 from app.db.session import AsyncSessionLocal, set_tenant_context
 from app.services.llm_triage import TriageFailed, triage_ticket
-from app.services.queue import TRIAGE_QUEUE_NAME, TriageJob
+from app.services.queue import EMBED_QUEUE_NAME, TRIAGE_QUEUE_NAME, EmbedJob, TriageJob
+from app.services.ticket_embedding import EmbeddingFailed, generate_embedding
 from app.services.ticket_events import SYSTEM_ACTOR_ID, publish_ticket_update
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("worker.triage")
+
+TJob = TypeVar("TJob", bound=BaseModel)
 
 
 async def _process_job(job: TriageJob) -> None:
@@ -193,37 +240,106 @@ async def _process_job(job: TriageJob) -> None:
         )
 
 
+async def _process_embed_job(job: EmbedJob) -> None:
+    async with AsyncSessionLocal() as session:
+        await set_tenant_context(session, job.org_id)
+        result = await session.execute(select(Ticket).where(Ticket.id == job.ticket_id))
+        ticket = result.scalar_one_or_none()
+        if ticket is None:
+            # Same poison-message reasoning as _process_job above.
+            raise LookupError(
+                f"ticket {job.ticket_id} not found under org {job.org_id} — "
+                "already deleted, or a malformed/stale job"
+            )
+
+        try:
+            # Always re-read title/description fresh from the row just
+            # looked up above, never carried on the job payload — see
+            # EmbedJob's own docstring in queue.py for why that's the
+            # actual point: this job is safe to fire on every edit with
+            # no ordering assumption, because whichever EmbedJob for
+            # this ticket happens to run last always embeds whatever the
+            # ticket's title/description actually are *right now*.
+            embedding = await generate_embedding(ticket.title, ticket.description)
+        except EmbeddingFailed as exc:
+            # A handled, terminal outcome, same shape as TriageFailed
+            # above — but unlike a failed triage, there's no visible
+            # ticket-level state to set here. An unembedded ticket isn't
+            # stuck or broken the way a triage_status=failed ticket is
+            # meant to be noticed and possibly retried by a human; it
+            # simply can never surface as, or be matched against, a
+            # possible duplicate until some future edit successfully
+            # re-triggers this job. Logged for operational visibility,
+            # not surfaced on the ticket itself.
+            logger.error("embedding failed for ticket=%s: %s", ticket.id, exc)
+            return
+
+        ticket.embedding = embedding
+        await session.commit()
+        logger.info("embedded ticket=%s org=%s", ticket.id, job.org_id)
+
+
+async def _consume(
+    queue: aio_pika.abc.AbstractQueue,
+    job_model: type[TJob],
+    process: Callable[[TJob], Awaitable[None]],
+) -> None:
+    """Generic consume loop shared by both queues — the ack/nack shape
+    (unparseable -> reject no requeue, LookupError -> poison message,
+    reject no requeue, anything else -> transient, requeue, success ->
+    ack) is identical for triage and embedding jobs alike; only the job
+    model and the processing function differ. See main() for the two
+    call sites, each on its own channel.
+    """
+    async with queue.iterator() as queue_iter:
+        async for message in queue_iter:
+            try:
+                job = job_model.model_validate_json(message.body)
+            except Exception:
+                logger.exception("unparseable message on %r, rejecting without requeue", queue.name)
+                await message.nack(requeue=False)
+                continue
+
+            try:
+                await process(job)
+            except LookupError:
+                logger.warning(
+                    "poison message for ticket=%s on %r, rejecting without requeue",
+                    job.ticket_id,
+                    queue.name,
+                )
+                await message.nack(requeue=False)
+            except Exception:
+                logger.exception(
+                    "transient failure processing ticket=%s on %r, requeueing", job.ticket_id, queue.name
+                )
+                await message.nack(requeue=True)
+            else:
+                await message.ack()
+
+
 async def main() -> None:
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
     async with connection:
-        channel = await connection.channel()
-        # See module docstring's "two workers running at once" section —
-        # without this, one worker can starve every other one instead of
-        # the queue's work being shared fairly.
-        await channel.set_qos(prefetch_count=1)
-        queue = await channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
+        # Separate channels, not just separate queues on one shared
+        # channel — see module docstring's "two queues, two jobs" section
+        # for why: each channel's own prefetch_count=1 QoS applies
+        # independently, so a burst of embedding jobs (or a slow Gemini
+        # call) can never starve triage's fair share of this worker's
+        # attention, or vice versa.
+        triage_channel = await connection.channel()
+        embed_channel = await connection.channel()
+        await triage_channel.set_qos(prefetch_count=1)
+        await embed_channel.set_qos(prefetch_count=1)
+        triage_queue = await triage_channel.declare_queue(TRIAGE_QUEUE_NAME, durable=True)
+        embed_queue = await embed_channel.declare_queue(EMBED_QUEUE_NAME, durable=True)
 
-        logger.info("worker started, consuming %r", TRIAGE_QUEUE_NAME)
+        logger.info("worker started, consuming %r and %r", TRIAGE_QUEUE_NAME, EMBED_QUEUE_NAME)
 
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                try:
-                    job = TriageJob.model_validate_json(message.body)
-                except Exception:
-                    logger.exception("unparseable message, rejecting without requeue")
-                    await message.nack(requeue=False)
-                    continue
-
-                try:
-                    await _process_job(job)
-                except LookupError:
-                    logger.warning("poison message for ticket=%s, rejecting without requeue", job.ticket_id)
-                    await message.nack(requeue=False)
-                except Exception:
-                    logger.exception("transient failure processing ticket=%s, requeueing", job.ticket_id)
-                    await message.nack(requeue=True)
-                else:
-                    await message.ack()
+        await asyncio.gather(
+            _consume(triage_queue, TriageJob, _process_job),
+            _consume(embed_queue, EmbedJob, _process_embed_job),
+        )
 
 
 if __name__ == "__main__":
