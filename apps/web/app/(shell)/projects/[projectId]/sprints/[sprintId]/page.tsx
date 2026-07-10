@@ -49,6 +49,27 @@ function TypeBadge({ type }: { type: TicketType }) {
   );
 }
 
+// Warning, not accent — nothing about this signal is AI-generated (a
+// purely rule-based scoring pass, no LLM call anywhere in its pipeline;
+// see apps/api/app/services/at_risk.py's module docstring). Same
+// vocabulary as the board page's own AtRiskIndicator
+// (apps/web/app/(shell)/projects/[projectId]/page.tsx) — this sprint
+// page has no shared component file with that one, so it's its own
+// small copy rather than a cross-file import for one four-line badge.
+function AtRiskBadge({ ticket }: { ticket: Ticket }) {
+  if (!ticket.atRisk) return null;
+
+  return (
+    <div
+      className="mb-1.5 flex items-center gap-1.5 text-[10px] text-warning"
+      title={ticket.atRiskReasons?.join(" · ") ?? undefined}
+    >
+      <span className="h-1 w-1 flex-shrink-0 rounded-full bg-warning" aria-hidden="true" />
+      At risk
+    </div>
+  );
+}
+
 function Card({ ticket, ticketKey, draggable }: { ticket: Ticket; ticketKey: string; draggable: boolean }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: ticket.id,
@@ -75,6 +96,7 @@ function Card({ ticket, ticketKey, draggable }: { ticket: Ticket; ticketKey: str
         <TypeBadge type={ticket.type} />
       </div>
       <p className="mb-1.5 leading-snug text-ink">{ticket.title}</p>
+      <AtRiskBadge ticket={ticket} />
       <span className="font-mono text-[11px] text-ink-tertiary">
         {ticket.storyPoints === null ? "unestimated" : `${ticket.storyPoints} pts`}
       </span>
@@ -387,6 +409,12 @@ export default function SprintPlanningPage() {
           </div>
           <p className="text-xs text-ink-tertiary">
             {sprint.startDate} → {sprint.endDate} · {sprint.totalPoints} pts committed
+            {/* Only ever non-null for the active sprint (see
+                apps/api/app/services/at_risk.py) — a planned/completed
+                sprint shows nothing here rather than a misleading 0. */}
+            {sprint.atRiskCount !== null && sprint.atRiskCount > 0 && (
+              <span className="text-warning"> · {sprint.atRiskCount} at risk</span>
+            )}
           </p>
         </div>
         <div className="flex gap-2">

@@ -171,6 +171,28 @@ function AppSecIndicator({ ticket }: { ticket: Ticket }) {
   );
 }
 
+// Warning, not accent — accent on this card is reserved specifically
+// for "AI touched this" (TriageIndicator, AppSecIndicator above), and
+// nothing about this signal is AI-generated: it's a purely rule-based
+// scoring pass with no LLM call anywhere in its pipeline (see
+// apps/api/app/services/at_risk.py's module docstring for the full
+// reasoning on why an LLM step is even less justified here than it was
+// for AppSec). Null for every ticket not currently in its project's
+// active sprint — see the same module.
+function AtRiskIndicator({ ticket }: { ticket: Ticket }) {
+  if (!ticket.atRisk) return null;
+
+  return (
+    <div
+      className="mb-2 flex items-center gap-1.5 text-[10px] text-warning"
+      title={ticket.atRiskReasons?.join(" · ") ?? undefined}
+    >
+      <span className="h-1 w-1 flex-shrink-0 rounded-full bg-warning" aria-hidden="true" />
+      At risk
+    </div>
+  );
+}
+
 // Types a parsed candidate can ever carry (see ticket_parse.py's own
 // prompt) — deliberately excludes "subtask", which needs a specific
 // parent ticket that free text alone can't determine.
@@ -518,6 +540,7 @@ function Card({
       <p className="mb-2 leading-snug text-ink">{ticket.title}</p>
       <TriageIndicator ticket={ticket} />
       <AppSecIndicator ticket={ticket} />
+      <AtRiskIndicator ticket={ticket} />
       <div className="flex items-center justify-between gap-2">
         <span
           title={assignee ? assignee.email : "Unassigned"}

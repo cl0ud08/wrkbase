@@ -86,6 +86,14 @@ export interface Ticket {
   appsecReviewedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  // Computed at read time, never stored (see
+  // apps/api/app/services/at_risk.py's module docstring) — null for
+  // every ticket not currently in its project's active sprint, since
+  // risk only means anything relative to an active sprint's own
+  // deadline. Only actually populated by GET .../tickets and GET
+  // .../tickets/{id}; every other ticket response leaves these null.
+  atRisk: boolean | null;
+  atRiskReasons: string[] | null;
 }
 
 // No TicketTreeNode type yet: nothing on the frontend consumes the /tree
@@ -120,6 +128,8 @@ interface TicketApiResponse {
   appsec_reviewed_at: string | null;
   created_at: string;
   updated_at: string;
+  at_risk: boolean | null;
+  at_risk_reasons: string[] | null;
 }
 
 export function mapTicket(data: TicketApiResponse): Ticket {
@@ -151,6 +161,8 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     appsecReviewedAt: data.appsec_reviewed_at,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
+    atRisk: data.at_risk,
+    atRiskReasons: data.at_risk_reasons,
   };
 }
 
@@ -371,6 +383,12 @@ export interface Sprint {
   // totalPoints (what finished) plus whatever was captured in the
   // returned-ticket snapshot at the moment of completion.
   pointsPlanned: number | null;
+  // Computed server-side, only for the currently ACTIVE sprint (null for
+  // planned/completed — see apps/api/app/services/at_risk.py). Never
+  // derive this by counting atRisk client-side across a fetched ticket
+  // list; same "backend is the only place guaranteed consistent"
+  // reasoning as totalPoints above.
+  atRiskCount: number | null;
   createdAt: string;
   retroStatus: SprintRetroStatus | null;
   retroNarrative: string | null;
@@ -392,6 +410,7 @@ interface SprintApiResponse {
   status: SprintStatus;
   total_points: number;
   points_planned: number | null;
+  at_risk_count: number | null;
   created_at: string;
   retro_status: SprintRetroStatus | null;
   retro_narrative: string | null;
@@ -414,6 +433,7 @@ export function mapSprint(data: SprintApiResponse): Sprint {
     status: data.status,
     totalPoints: data.total_points,
     pointsPlanned: data.points_planned,
+    atRiskCount: data.at_risk_count,
     createdAt: data.created_at,
     retroStatus: data.retro_status,
     retroNarrative: data.retro_narrative,

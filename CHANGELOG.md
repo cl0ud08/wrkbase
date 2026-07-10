@@ -3464,3 +3464,144 @@ real one, then restored), not just described: every proof-script
 assertion above was actually executed and passed, including the
 points-planned-vs-done math for a mixed sprint (3 done / 7 planned)
 and the regenerate flow's new-timestamp check.
+
+---
+
+## Slice 32 — Phase 4, slice 2: at-risk ticket detection, and a
+deliberate departure from the roadmap's original LLM-narrated plan
+
+**Built:** a small, explicit, rule-based scoring pass
+(`app/services/at_risk.py`) over every ticket in a project's currently
+ACTIVE sprint — unowned-and-not-started, no activity in a while, and
+low sprint runway for unfinished work, three signals requiring at least
+two to co-occur before a ticket is actually flagged. Computed fresh on
+every read, surfaced as a warning-colored badge on ticket cards (board
+and sprint views) and an "N at risk" rollup on the sprint header.
+
+**The updated_at investigation, and why the finding didn't kill the
+signal.** The roadmap for this slice assumed a "stale, no updates"
+check built on `Ticket.updated_at`. Reading the actual trigger SQL
+(migrations 0004/0005, `tickets_set_updated_at`) rather than trusting
+the column's name: it's an unconditional `BEFORE UPDATE`, no `WHEN`
+clause, firing on any write to a tickets row — including the triage
+worker setting `priority`/`labels`, the embed worker setting
+`embedding`, the appsec worker setting `appsec_review_status`. On its
+face that disqualifies `updated_at` as a "human touched this" signal.
+But tracing through *when* those writes actually happen changes the
+conclusion: `TriageJob`, `EmbedJob`, and `AppSecJob` are all published
+synchronously, only from `create_ticket`/`update_ticket`, and only ever
+as an immediate reaction to a human action — never independently, never
+on a schedule, never a second time later on their own. The gap between
+"a human edited this ticket" and "the resulting worker write lands" is
+bounded by ordinary job latency — seconds, occasionally longer under
+load — never days. At the day-granularity this feature actually
+operates at (is a ticket stale by *days*, not by minutes), that gap is
+noise. `updated_at` is used here as a real, if slightly imprecise,
+"time since any activity, human or its immediate automated follow-on"
+signal — not naively trusted as if the trigger were scoped to human
+edits, and not discarded either, since discarding it would throw away
+real signal over a corruption window that turns out not to matter at
+the timescale that matters. Reworking the trigger itself (a `WHEN`
+clause excluding AI-pipeline-owned columns) was considered and
+rejected: it would change `updated_at`'s semantics for the whole app —
+a strictly bigger, riskier change than this feature needs, for a
+precision improvement that wouldn't change a single day-granularity
+result.
+
+**Why 2-of-3, not any single signal.** Each of the three checks is
+individually weak and noisy on its own: being unowned and unstarted is
+completely normal on day one of a sprint; low runway is true for
+nearly every unfinished ticket in a sprint's final days regardless of
+whether anything is actually wrong with any one of them; staleness
+alone can just mean a ticket is genuinely fine and hasn't needed
+touching. Requiring two independent signals to co-occur is what turns
+three individually weak, gameable heuristics into a real signal worth
+surfacing on a board — the same reasoning already behind AppSec's flag
+being additive across matched categories rather than firing loudly on
+the weakest possible match. `verify_at_risk.py` proves this directly,
+not just asserts it: a ticket with exactly one fired signal (low
+runway alone) is checked to stay under the threshold, both in the pure
+unit tests and over real HTTP.
+
+**Zero LLM calls anywhere in this feature's pipeline — the sharpest
+reasoning in this slice, and a real departure from what the roadmap
+assumed.** The original plan for this slice was an LLM-narrated
+version of the risk flag, the same keyword-gate-then-LLM shape AppSec
+used. Working through what that LLM step would actually be asked to do
+is what killed it. AppSec's LLM call does real work: it reads genuinely
+unstructured free text — the ticket's own title and description — and
+produces guidance that requires actual language understanding to
+synthesize, because the input has no fixed shape and the checklist
+items that apply depend on what the ticket specifically says. That's
+synthesis a template cannot perform. At-risk detection has no
+equivalent free-text step anywhere in its pipeline. Every input to a
+risk assessment is already a clean, structured fact this module
+computed itself before an LLM would ever be called: `assignee_id`
+is/isn't `NULL`, a `workflow_state_id` equality check, an integer day
+count. The only thing a "narrate this in plain language" LLM step
+could possibly add is turning `unowned_and_not_started=True,
+days_since_update=5, days_remaining=2` into a sentence — which a plain
+f-string already does, exactly, deterministically, instantly, with
+zero risk of a model paraphrasing "2 days" as "about a week" or
+dropping a fact under latency pressure. AppSec's cost argument (most
+tickets don't need review, an LLM call on all of them would be wasted
+spend) applies here too, but it's not the deciding one — the deciding
+one is that the entire value proposition an LLM call would need to
+justify itself (turning unstructured text into tailored judgment)
+simply isn't present anywhere in this feature's inputs. That's a
+stronger, structural conclusion than "not worth it for every ticket" —
+the reasoning doesn't support an LLM step for *any* flagged ticket, not
+just most of them. This is the one place in Phase 3/4 so far where the
+original roadmap's plan was reasoned through and explicitly not built,
+rather than built and then justified after the fact.
+
+**On-demand, not scheduled — and why a cache would be strictly worse,
+not just unneeded.** Every prior AI feature in this app (triage,
+embedding, AppSec review, sprint retro) needed async machinery because
+each did something genuinely expensive worth caching: a real LLM call,
+with real latency and real failure modes, whose result then had to be
+stored so it wasn't repeated on every read. Risk scoring has no
+expensive step to amortize — a handful of field comparisons plus one
+or two already-established-pattern queries (the project's workflow-
+state order bounds, the project's one active sprint), on data already
+being fetched for the same request regardless. Computing it fresh on
+every read (the same pattern `Sprint.total_points` and
+`Sprint.points_planned` already established) isn't just simpler than
+caching it — a cached/scheduled version would be actively worse. A
+periodic rescore (the one option this app has zero existing
+infrastructure for — no cron container, no APScheduler, no scheduled
+GitHub Actions workflow anywhere in this repo, confirmed by searching,
+not assumed absent) introduces a real staleness window of its own: a
+cached score going stale between runs, worst exactly when a sprint is
+ending fast and ticket state is changing quickly — precisely the
+moment an at-risk signal needs to be most current, not most delayed.
+On-demand computation doesn't have that failure mode at all, because
+there is nothing to go stale. Building scheduling infrastructure here
+to solve a staleness problem on-demand computation doesn't have would
+have been exactly the kind of "because the pattern exists" over-
+engineering this app has avoided everywhere else.
+
+**Extended the proof-script pattern, with no LLM stub or worker needed
+at all.** `scripts/verify_at_risk.py` is the first CI-wired proof
+script in Phase 3/4 that needs neither the fake LLM stub server nor an
+extra worker process — a direct, visible consequence of the zero-LLM
+conclusion above. Pure, synchronous checks cover a deliberately
+at-risk ticket (all 3 signals, flagged), a healthy one (0 signals, not
+flagged), a ticket with exactly 1 fired signal (correctly under
+threshold), a ticket in the terminal column (never at risk regardless
+of every other factor), and an overdue-but-still-active sprint (a
+negative days-remaining still counts, with its own reason string).
+Then the same over real HTTP for two independent orgs each running
+their own active sprint at the same moment — specifically to exercise
+this slice's two genuinely new queries (`find_active_sprint`,
+`workflow_state_bounds`) under concurrent multi-tenant load, not just
+a single org where scoping bugs would have nowhere to show up.
+
+**Verified:** all 18 CI-wired backend proof scripts pass, including the
+new `verify_at_risk.py`, plus a re-run of `verify_tickets_rls.py` and
+`verify_sprints_rls.py` as regression checks against the `list_tickets`/
+`get_ticket`/sprint-serialization changes; `ruff check .` clean;
+frontend `tsc --noEmit`, `ESLint`, and a full `next build` all clean.
+No migration in this slice at all — the first AI-adjacent slice with no
+schema change of any kind, a direct consequence of computing everything
+at read time and persisting nothing.
