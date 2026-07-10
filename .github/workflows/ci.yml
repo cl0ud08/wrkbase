@@ -462,6 +462,26 @@ jobs:
       - name: Verify sprint retro
         run: python -m scripts.verify_sprint_retro
 
+      - name: Reset rate limiter (at-risk detection)
+        run: python -c "import os, redis; redis.from_url(os.environ['REDIS_URL']).flushall()"
+
+      # Phase 4 slice 2: at-risk ticket detection. Unlike every other
+      # AI-adjacent slice above, this one needs no fake LLM stub server and
+      # no extra worker process -- it makes zero LLM calls anywhere in its
+      # pipeline (see app/services/at_risk.py's own module docstring for
+      # why that's a stronger conclusion than AppSec's keyword gate ever
+      # reached), so it's pure rule-based scoring against the already-
+      # running API server. Covers scoring accuracy directly (pure,
+      # synchronous, no I/O) including the 2-of-3 threshold genuinely
+      # requiring two signals rather than firing on any one alone, the
+      # terminal-column exclusion, and the "not in an active sprint at
+      # all" None case; then the same over real HTTP for two independent
+      # orgs each running their own active sprint concurrently, plus the
+      # sprint-level at_risk_count rollup and the usual direct cross-org
+      # rejection check.
+      - name: Verify at-risk detection
+        run: python -m scripts.verify_at_risk
+
       - name: Run pytest suite (if any test files exist yet)
         run: |
           if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
