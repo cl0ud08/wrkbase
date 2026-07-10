@@ -3098,3 +3098,192 @@ and a link, a genuinely different ticket creates with no warning, a
 second project never sees a match despite identical underlying text,
 and editing a ticket's title/description measurably changes what it
 matches against afterward.
+
+---
+
+## Slice 30 — Phase 3, slice 5: the AI Security Champion, this project's
+headline AppSec differentiator
+
+**Built:** a small, explicit, human-curated trigger library
+(`app/services/appsec_triggers.py`) covering five security-relevant
+categories — file upload, auth/permission changes, payment/PII
+handling, external API calls, admin permission changes — each with a
+keyword list and a concrete checklist. A ticket whose title/description
+matches any category is flagged synchronously, at creation or edit
+time, with zero LLM involvement in that decision. A matched ticket then
+gets a real LLM call (Groq-primary/Gemini-fallback, via the same
+`llm_client.py` triage, parsing, and duplicate detection all build on)
+that writes one tailored comment applying the matched categories'
+checklists to what the ticket actually says — not a templated dump of
+the static list. Surfaced on the board as an accent-colored "AppSec
+review required" badge.
+
+**Two honest gaps, checked directly rather than assumed away, with a
+concrete fallback for each.** This project has no ticket-comment
+system — verified by grepping every model, migration, and API route in
+`apps/api`, not inferred from its absence being unsurprising; the
+codebase already carried explicit "no comment system exists" notes
+from Slice 27's `triage_reasoning`, which hit this exact gap first.
+`appsec_comment` is a plain field on the ticket, following that same
+precedent rather than building on top of infrastructure that was never
+actually there. Separately, this app has no standalone ticket-detail
+page at all — every ticket is managed inline on the board, backlog, or
+sprint views, confirmed by checking every route under
+`app/(shell)/projects/[projectId]/`. Requirement 5's "badge on the card
+and in the ticket detail view" narrows to just the card, the only place
+a ticket is ever actually shown; there's no second surface to add a
+badge to yet, and inventing a whole new page to satisfy the letter of
+a requirement whose premise doesn't hold here would be scope invented
+for its own sake, not a real gap this slice needs to close.
+
+**Why the keyword-gate-then-LLM design is more strongly justified here
+than the same shape was for triage or embedding.** Triage and embedding
+call an LLM unconditionally, for every ticket, because every ticket
+genuinely needs a priority and a duplicate-detection vector — there's
+no meaningful gate to put in front of a question every ticket has a
+real answer to. AppSec review is a different shape of question
+entirely: "does this specific ticket carry security implications,"
+where the honest answer for the large majority of tickets (a copy
+change, a color tweak, a backlog reorder) is no. Paying for an LLM call
+on every single ticket to arrive at "nothing to flag" would be cost
+spent for zero signal, on a scale the other two features don't share.
+That's the *cost* argument, and it would be sufficient on its own — but
+there's a second, independent argument specific to this being a
+*security* control, worth stating in full rather than folding into the
+cost point: a security process benefits from being predictable and
+auditable in a way a priority label doesn't. A rule-based gate is
+something a security-minded reader can open and read — "these five
+categories, these keywords, this is what gets checked" — and extend
+deliberately, by adding a keyword or a whole new category. An LLM
+silently deciding "nothing to see here" on a security-relevant ticket,
+with no fixed vocabulary to point to afterward and ask *why not*, is a
+worse failure mode for this specific kind of control than for a
+priority label that's wrong: a missed triage priority gets corrected
+next time someone looks at the ticket; a missed security review can
+mean a real vulnerability shipped without anyone ever having looked.
+Determinism and auditability aren't a consolation prize for skipping an
+LLM call here — for a security-relevant gate specifically, they're a
+property worth having independent of cost.
+
+**The accepted false-negative tradeoff, stated as a real limitation, not
+glossed over.** A plain substring match against title/description has
+real, honest recall limits: a ticket that says "let users attach
+supporting documents" without ever using the word "upload" will not
+match `file_upload`, even though a human reviewer would recognize it
+instantly. This is an accepted, deliberate tradeoff, not an oversight —
+the keyword lists in `appsec_triggers.py` lean wide rather than
+precise specifically to manage it (`file_upload` alone matches on
+"upload," "attachment," "attach a file," "import file," "import csv,"
+"csv import," "image upload," "profile picture," "avatar," and "file
+input"), accepting more false positives (an extra, cheap LLM call
+spent on a ticket that turns out not to need one) in exchange for fewer
+false negatives (a real security-relevant ticket going completely
+unflagged). That asymmetry is deliberate: a false positive here costs
+a human a few seconds skimming a note they can dismiss; a false
+negative costs nothing visibly, which is exactly what makes it
+dangerous. The keyword lists are living data, meant to be extended as
+real gaps get discovered — an explicit maintenance surface, not a
+one-time list.
+
+**A third, fully independent job and queue — the same coupling argument
+from triage vs. embedding, reapplied rather than assumed to transfer
+automatically.** AppSec review's own LLM call has nothing to do with
+whether triage or embedding succeed: different prompt, independent
+failure mode, no shared cause. Folding it into either existing job
+would recreate the exact problem Slice 29 already worked out for
+triage vs. embedding — nack-and-requeue on an AppSec-specific hiccup
+would redundantly re-run an already-succeeded triage or embedding
+call, silently re-paying for LLM work nothing asked to redo. `AppSecJob`
+gets its own queue (`ticket_appsec_review`), its own ack/nack lifecycle,
+consumed by a third concurrent loop in the same `worker` process (three
+channels now, each with independent `prefetch_count=1` QoS) — no new
+deployment topology, since the independence that matters is at the
+message level, not the process level.
+
+This case does introduce one genuinely new property triage and
+embedding don't share, addressed directly rather than left as an
+unstated wrinkle: `AppSecJob` is the first of the three that's
+*conditionally* published. `TriageJob` and `EmbedJob` go out for every
+ticket, unconditionally; `AppSecJob` only goes out when the keyword
+gate already matched, synchronously, before anything is published —
+most tickets never publish one at all. Does that change the separate-
+queue conclusion? No — and it's worth being precise about why not: the
+coupling argument above is about what happens *once a job exists and
+is being processed* (does its ack/nack outcome affect another job's
+retry budget), not about how often a job gets created in the first
+place. Conditional publishing changes this queue's traffic volume
+relative to the other two; it has no bearing on whether that traffic,
+once it exists, should share a message with a different job type. The
+two questions are independent, and only one of them is what the
+separate-queue decision actually turns on.
+
+**The flag is additive-only, and never silently cleared by an edit — a
+deliberate divergence from `EmbedJob`'s own trigger-not-snapshot
+precedent, not a reuse of it.** `EmbedJob` carries no title/description
+and the worker always re-reads the ticket's current text, specifically
+so a stale embedding can never survive an edit — whichever `EmbedJob`
+runs last always reflects the ticket's current reality, and that's
+unambiguously correct for embeddings: a vector describing text a
+ticket no longer has is simply wrong, with no legitimate reason to keep
+it around. `AppSecJob` reuses that same "always re-read current data"
+mechanic for *deciding what's newly relevant* — but `_apply_appsec_
+trigger` was deliberately written so an edit can only ever add
+categories to `appsec_categories`, never remove one, and
+`appsec_review_status` is never reset back to NULL once a ticket has
+ever been flagged. That's not an oversight carried over from copying
+`EmbedJob`'s shape; it's the opposite choice, made because a security
+flag is a fundamentally different kind of data than a similarity
+vector. An embedding has no meaning independent of the text it was
+computed from, so letting it track that text exactly, always, is
+strictly correct. A security flag means something different: it's a
+record that *at some point, real security-relevant wording appeared on
+this ticket*, and a human may or may not have acted on it yet. If a
+later edit that merely rewords the security-relevant part (or removes
+it without actually addressing the underlying concern) silently
+cleared the flag, the system would be actively erasing evidence that a
+review was ever warranted — the security equivalent of a vulnerability
+report closing itself the moment someone edits its title. The right
+analogy isn't `EmbedJob`; it's how a real security review process
+works: a flag is raised by evidence and cleared by a human decision,
+never by the evidence quietly changing shape. No "dismiss" action
+exists yet in this slice — a real gap, left explicitly for future work
+rather than papered over with an auto-clear that would defeat the
+entire point of the flag persisting in the first place.
+
+**Extended the proof-script pattern with two scripts, the same real-
+vs-stub split already established for every other LLM-backed feature
+in this app.** `scripts/verify_appsec_triggers.py` (CI-wired) starts
+with pure, synchronous, no-HTTP assertions — `match_triggers` has no
+I/O at all — covering all five categories with a realistic matching
+ticket *and* a realistic unrelated one each (a real false-positive/
+false-negative check, not just "the mechanism runs"), then exercises
+the full async pipeline against the local stub (synchronous flagging
+before the worker runs, the worker completing a review and storing a
+real comment, an edit introducing a new category triggering a fresh
+review, a second edit's new category merging in rather than replacing
+the first, and the same cross-org poison-job rejection check already
+proven for `TriageJob`). `scripts/verify_appsec_review_llm.py` (not
+CI-wired, real Groq/Gemini APIs, run manually) is where "genuinely
+tailored" actually gets checked, since the stub's deterministic
+response has no real language understanding to judge that against:
+two different tickets in the same category must produce genuinely
+different comments, each comment must reference a concrete detail
+specific to its own ticket's wording, and no raw checklist sentence
+may appear verbatim — plus the same real-Gemini-fallback and both-
+providers-fail checks already proven for triage and parsing.
+
+**Verified:** all 15 backend proof scripts pass, including the new
+`verify_appsec_triggers.py`, re-run against the CI-representative
+local stub setup (stub server + two stub-pointed workers + a stub
+-pointed API process, matching CI's job-level env exactly);
+`verify_appsec_review_llm.py` passes against the real Groq and Gemini
+APIs, including the tailored-comment checks and a real Gemini fallback
+with Groq deliberately broken; `ruff check .` clean; `pip-audit`
+clean; frontend `ESLint`, `tsc --noEmit`, and a full `next build` all
+clean. Manually verified end to end against the real APIs (not just
+proof-script assertions): a file-upload ticket flags synchronously
+with the right category, the worker's completed comment references
+the ticket's own specifics (the JPG/PNG avatar, the Stripe invoice
+logo), an unrelated ticket never flags at all, and editing a trivial
+ticket into security-relevance triggers a real, correctly-merged
+review.

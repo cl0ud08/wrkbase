@@ -125,6 +125,52 @@ function TriageIndicator({ ticket }: { ticket: Ticket }) {
   );
 }
 
+// pending/completed/failed clears or updates itself the instant the
+// worker's live update arrives, the same live-update mechanism
+// TriageIndicator above already uses. Accent, not a semantic danger/
+// warning color, on purpose: this app reserves accent specifically for
+// "AI touched this" (TriageIndicator's own pending dot, the NL-parse
+// review step's "AI preview" caption) — introducing a second meaning
+// for accent, or reaching for danger/warning instead just because this
+// is a security feature, would fork that vocabulary rather than extend
+// it. The underlying trigger match itself is deterministic keyword
+// matching, not AI-generated (see appsec_triggers.py), but the
+// guidance attached to a match is, and the feature is presented as one
+// coherent AI-assisted capability end to end, consistent with how
+// every other AI feature in this app is framed.
+function AppSecIndicator({ ticket }: { ticket: Ticket }) {
+  if (!ticket.appsecReviewStatus) return null;
+
+  if (ticket.appsecReviewStatus === "pending") {
+    return (
+      <div className="mb-2 flex items-center gap-1.5 text-[10px] text-accent">
+        <span className="h-1 w-1 flex-shrink-0 animate-pulse rounded-full bg-accent" aria-hidden="true" />
+        AppSec review pending…
+      </div>
+    );
+  }
+
+  // completed or failed: the flag itself (and which categories matched)
+  // is never in doubt either way — only whether tailored AI guidance
+  // exists to go with it. Title-tooltipped with the comment, same
+  // "hover for why" pattern as TriageIndicator's reasoning tooltip.
+  return (
+    <div
+      className="mb-2 flex flex-wrap items-center gap-1"
+      title={ticket.appsecComment ?? undefined}
+    >
+      <span className="rounded-sm bg-accent-subtle px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-accent uppercase">
+        AppSec review required
+      </span>
+      {ticket.appsecReviewStatus === "failed" && (
+        <span className="text-[10px] text-ink-tertiary" title={ticket.appsecReviewError ?? undefined}>
+          (AI guidance unavailable)
+        </span>
+      )}
+    </div>
+  );
+}
+
 // Types a parsed candidate can ever carry (see ticket_parse.py's own
 // prompt) — deliberately excludes "subtask", which needs a specific
 // parent ticket that free text alone can't determine.
@@ -471,6 +517,7 @@ function Card({
       </div>
       <p className="mb-2 leading-snug text-ink">{ticket.title}</p>
       <TriageIndicator ticket={ticket} />
+      <AppSecIndicator ticket={ticket} />
       <div className="flex items-center justify-between gap-2">
         <span
           title={assignee ? assignee.email : "Unassigned"}

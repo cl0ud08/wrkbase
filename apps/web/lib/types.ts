@@ -38,6 +38,7 @@ export function mapProject(data: ProjectApiResponse): Project {
 export type TicketType = "epic" | "story" | "task" | "subtask";
 export type TicketPriority = "low" | "medium" | "high" | "critical";
 export type TriageStatus = "pending" | "triaged" | "failed";
+export type AppSecReviewStatus = "pending" | "completed" | "failed";
 
 export interface Ticket {
   id: string;
@@ -73,6 +74,16 @@ export interface Ticket {
   triageReasoning: string | null;
   triageError: string | null;
   triagedAt: string | null;
+  // NULL for the vast majority of tickets — no AppSec trigger category
+  // has ever matched (apps/api/app/services/appsec_triggers.py). Set to
+  // "pending" synchronously the instant a keyword match happens, then
+  // flipped to "completed"/"failed" by the async review worker — see
+  // apps/api/app/services/appsec_review.py.
+  appsecReviewStatus: AppSecReviewStatus | null;
+  appsecCategories: string[] | null;
+  appsecComment: string | null;
+  appsecReviewError: string | null;
+  appsecReviewedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -102,6 +113,11 @@ interface TicketApiResponse {
   triage_reasoning: string | null;
   triage_error: string | null;
   triaged_at: string | null;
+  appsec_review_status: AppSecReviewStatus | null;
+  appsec_categories: string[] | null;
+  appsec_comment: string | null;
+  appsec_review_error: string | null;
+  appsec_reviewed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -128,6 +144,11 @@ export function mapTicket(data: TicketApiResponse): Ticket {
     triageReasoning: data.triage_reasoning,
     triageError: data.triage_error,
     triagedAt: data.triaged_at,
+    appsecReviewStatus: data.appsec_review_status,
+    appsecCategories: data.appsec_categories,
+    appsecComment: data.appsec_comment,
+    appsecReviewError: data.appsec_review_error,
+    appsecReviewedAt: data.appsec_reviewed_at,
     createdAt: data.created_at,
     updatedAt: data.updated_at,
   };
@@ -256,6 +277,10 @@ export interface TicketUpdatedEvent {
       | "triageReasoning"
       | "triageError"
       | "triagedAt"
+      | "appsecReviewStatus"
+      | "appsecComment"
+      | "appsecReviewError"
+      | "appsecReviewedAt"
     >
   >;
   // The acting user's id — lets a receiving client tell "someone else moved
@@ -285,6 +310,10 @@ interface TicketUpdatedEventApiPayload {
     triage_reasoning?: string;
     triage_error?: string;
     triaged_at?: string;
+    appsec_review_status?: AppSecReviewStatus;
+    appsec_comment?: string;
+    appsec_review_error?: string;
+    appsec_reviewed_at?: string;
   };
   updated_by: string;
 }
@@ -302,6 +331,10 @@ export function mapTicketUpdatedEvent(data: TicketUpdatedEventApiPayload): Ticke
   if ("triage_reasoning" in data.changes) changes.triageReasoning = data.changes.triage_reasoning;
   if ("triage_error" in data.changes) changes.triageError = data.changes.triage_error;
   if ("triaged_at" in data.changes) changes.triagedAt = data.changes.triaged_at;
+  if ("appsec_review_status" in data.changes) changes.appsecReviewStatus = data.changes.appsec_review_status;
+  if ("appsec_comment" in data.changes) changes.appsecComment = data.changes.appsec_comment;
+  if ("appsec_review_error" in data.changes) changes.appsecReviewError = data.changes.appsec_review_error;
+  if ("appsec_reviewed_at" in data.changes) changes.appsecReviewedAt = data.changes.appsec_reviewed_at;
   return {
     type: data.type,
     projectId: data.project_id,
