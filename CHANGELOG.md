@@ -2907,3 +2907,194 @@ verified by exercising the exact same HTTP endpoints the UI calls
 (`verify_ticket_parse.py`) plus clean lint/typecheck/build, stated
 here plainly rather than implied as equivalent to having actually
 clicked through it.
+
+---
+
+## Slice 29 — Phase 3, slice 4: semantic duplicate detection, and what
+13 real ticket pairs revealed about the actual limits of the approach
+
+**Built:** `tickets.embedding` (pgvector `vector(768)`, migration 0019
+— the first real use of the extension since it was locked into the
+Postgres image in Phase 0), populated asynchronously by a new
+`EmbedJob`/`ticket_embedding` queue after ticket creation and again
+after any edit that touches title/description, and a synchronous
+`POST /projects/{id}/tickets/check-duplicates` endpoint that embeds a
+draft ticket's text and queries for existing tickets above a cosine
+-similarity threshold — surfaced as a non-blocking warning in both the
+manual creation form and the NL-parse review step, never a hard gate.
+
+**Groq has no embedding model at all — confirmed with a real 404, not
+assumed.** `AsyncGroq`'s client exposes an `embeddings` attribute, but
+that's inherited from the OpenAI-compatible SDK base it's built on, not
+a real Groq capability: its live model list has no embedding model on
+it, and calling `client.embeddings.create(...)` returns
+`"model_not_found"`. Unlike triage and ticket-parsing — both genuine
+Groq-primary/Gemini-fallback cases — there is no second provider here.
+Gemini's `gemini-embedding-001` is the only real option, called with
+`output_dimensionality=768` rather than its own 3072-dim default: not
+an arbitrary shrink, but a real constraint driving the choice —
+pgvector's ANN index types (HNSW, IVFFlat) have a hard 2000-dimension
+ceiling, so a 3072-dim column could never be indexed at all, only ever
+sequentially scanned. 768 is one of Gemini's own documented Matryoshka
+-trained reduced sizes (alongside 1536), not a naive truncation, and
+stays comfortably under that ceiling if this project's ticket volume
+ever grows enough to justify an index later — no second migration to
+shrink the column first if that day comes. No index is created yet at
+today's scale (a portfolio app's handful of demo projects, not
+millions of tickets) — pgvector's own guidance is to build IVFFlat/HNSW
+*after* a table has representative data, not speculatively on an empty
+one, and a plain sequential scan with `<=>` is fast enough here.
+
+**Two queues, two jobs, one process — not triage plus one more step.**
+Both triage and embedding are async for the identical reason: nobody
+is waiting on either result at ticket-creation time, so paying either
+one's latency inline would be pure cost with no user-facing benefit.
+That answers *whether* to background embedding generation; it doesn't
+answer whether it should be the *same* background job as triage — a
+separate question, decided by thinking through what combining them
+would actually cost, not by default. Folding embedding into
+`_process_job` would couple two outcomes that have nothing to do with
+each other: different providers entirely (Groq-then-Gemini for triage;
+Gemini-only for embedding), independent failure modes, no shared
+cause. A single combined job forces one ack/nack decision to cover
+both — nack-and-requeue on a transient embedding hiccup would silently
+re-run an already-succeeded triage call, re-paying for a real LLM
+classification nothing asked to redo; acking regardless of the
+embedding outcome would need its own internal partial-failure
+bookkeeping just to know a retry is still owed. Two independent
+messages (`TriageJob` on `ticket_triage`, `EmbedJob` on
+`ticket_embedding`) sidestep this entirely — each gets its own
+ack/nack lifecycle, its own retry budget, its own terminal-failure
+handling, and neither's outcome has any bearing on the other's. That
+argues for two *jobs*, not two *services*: both still run in the one
+`worker` process, on two concurrent consumer loops sharing one AMQP
+connection but separate channels, each with its own
+`prefetch_count=1` QoS so one queue's traffic can never starve the
+other's fair share. The independence that matters is at the message
+level, not the deployment topology — duplicating the container for a
+distinction that doesn't need it would be the same premature-topology
+mistake this app avoids everywhere else.
+
+**`EmbedJob` carries only `ticket_id`/`org_id` — deliberately not
+title/description, unlike `TriageJob`, and that difference is the
+entire fix for stale embeddings on edit.** `TriageJob` carries a copy
+of the title/description it was published with, read directly by
+`triage_ticket()` — correct for triage, where the job is a one-shot
+classification of whatever the ticket said *at creation time*.
+Embedding has a second trigger `TriageJob` never had: an edit, any
+time later, to the same fields the embedding was built from. If
+`EmbedJob` copied `TriageJob`'s shape, an edit would need to reason
+about *which* queued job is newest before trusting its payload — a
+real ordering hazard if two edits land close together. Instead
+`_process_embed_job` always re-reads title/description fresh from the
+ticket row at process time, and `EmbedJob` carries nothing to make
+that unnecessary. That makes an `EmbedJob` a trigger — "something
+about this ticket may have changed, re-embed it" — not a snapshot of
+what to embed, and firing it on every title/description-touching PATCH
+(exactly like create_ticket already does) becomes trivially safe with
+no ordering assumption: whichever `EmbedJob` for a given ticket happens
+to run *last* always embeds whatever the ticket's text actually is
+right now, regardless of how many are queued or in what order they
+arrive. Verified for real, not just reasoned about: created a ticket
+about CSV export, confirmed a Safari-login draft didn't match it,
+edited its title/description to be about Safari login, and confirmed
+it then did — the stored embedding demonstrably changed to the new
+text's value, not merely stopped matching the old one.
+
+**The threshold-tuning finding — worth real space, not a line item.**
+`scripts/tune_duplicate_threshold.py` ran 13 real ticket-title/
+description pairs through the real Gemini embedding API, across three
+categories. SIMILAR pairs (the same underlying bug or feature request,
+reworded — e.g. "Login fails on Safari" / "Safari login broken";
+"Password reset email never arrives" / "Reset password email not
+being delivered") scored 0.8351-0.9185. DIFFERENT pairs (genuinely
+unrelated — e.g. "Login fails on Safari" / "Add CSV export to reports
+page") scored 0.4632-0.5207 — a clean, unambiguous >0.3 gap between
+the two clusters, confirming semantic embeddings are doing real work
+at the topic level. The finding is the third category: ADJACENT pairs
+— same category, a genuinely *different* specific issue (e.g.
+"Password reset email never arrives" / "Verification email never
+arrives"; "Export tickets to CSV" / "Export tickets to PDF"; "Add dark
+mode toggle" / "Add light mode toggle"; "Login fails on Safari" /
+"Login fails on Firefox") — scored 0.7921-0.9300, a spread that
+genuinely overlaps *both* other clusters. "Password reset" and "email
+verification" are topically almost the same thing (an email that
+doesn't arrive) even though they're different bugs with different root
+causes; cosine similarity on a topic-level embedding has no way to
+represent that distinction, because the distinction isn't really about
+topic at all. This is not a tuning failure fixable with a better
+threshold — no single number can sit above every SIMILAR score and
+below every ADJACENT score, because the two ranges (0.8351-0.9185 and
+0.7921-0.9300) actually overlap. It's a real, structural precision
+ceiling on what topic-level semantic similarity can distinguish, and
+it's the direct, concrete justification for point 5 of this slice's
+own brief: a non-blocking warning, not a hard gate. A hard gate would
+periodically block a legitimately new ticket ("add light mode") just
+because it resembles an existing one ("add dark mode") closely enough
+in vector space, with no way to tell the difference from inside the
+embedding alone — a false positive with a real cost (a blocked
+action), not just a mildly annoying flag. `SIMILARITY_THRESHOLD = 0.83`
+sits just below the observed SIMILAR floor (catches every tested
+genuine duplicate) and enormously above the observed DIFFERENT ceiling
+(excludes every tested unrelated pair, large margin), landing inside
+the ADJACENT cluster's own real spread — exactly where a threshold
+belongs, given that cluster's scores genuinely straddle both of the
+others. An occasional flag on a merely-related (not actually
+duplicate) ticket costs a human one glance; a wrongly blocked creation
+costs real friction for no correctness gained.
+
+**RLS and the composite-FK-equivalent discipline apply cleanly to a
+similarity query too, confirmed rather than assumed** — the first
+query shape in this app that orders by a distance instead of an
+equality filter. RLS already restricts every row a session can see to
+the caller's own org; `project_id = :project_id` is the same explicit,
+defense-in-depth filter `_get_ticket_or_404` and friends already apply
+on top of RLS, not instead of it — a project id from a *different*
+project in the *same* org must still never leak in, which org-only RLS
+scoping wouldn't catch alone. None of that is specific to vector
+search; `ORDER BY embedding <=> :query_vector` just decides order and
+cutoff *within* that already-correctly-scoped row set, no differently
+in principle than `ORDER BY created_at` elsewhere. Proven directly:
+`verify_duplicate_detection.py` creates three tickets carrying the
+*exact same* stored embedding across three different scopes (same
+project, a different project in the same org, a different org
+entirely) and confirms a matching query in the first project surfaces
+only that project's own ticket — never the other two, despite the
+underlying vectors being byte-for-byte identical, which is precisely
+what would leak through first if either scoping layer were broken.
+
+**Extended the proof-script pattern with two scripts, deliberately
+split the same way triage's real-vs-stub proofs already are.**
+`scripts/_fake_llm_server.py` gained a content-aware `embed_content`
+handler for `verify_duplicate_detection.py` (CI-wired): since there's
+no cheap way to approximate real semantic meaning, it returns one of
+three *geometrically constructed* vectors (two orthonormal basis
+vectors in 768-dim space, mixed by a chosen angle) with exactly known
+cosine similarities — 0.9 for a "near" pair, 0.0 for a "far" pair —
+selected by a plainly-named sentinel in the request text, the same
+"visible in both places, not hidden" convention `stub_trigger_low
+_confidence` already established last slice. This tests the plumbing
+this app's own code actually owns (the pgvector query, its project/org
+scoping, the threshold comparison, re-embedding on edit)
+deterministically and for free, every push. Whether Gemini's real
+embeddings are semantically good enough for the tuned threshold to
+mean anything against real ticket text is a different question,
+answered separately and manually by
+`scripts/tune_duplicate_threshold.py` against the real API — not
+wired into CI, for the same cost-and-non-determinism reasoning already
+established for `verify_triage_llm.py`.
+
+**Verified:** all 13 backend proof scripts pass, including the new
+`verify_duplicate_detection.py`, re-run against the CI-representative
+local stub setup (stub server + two stub-pointed workers + a stub
+-pointed API process, matching CI's job-level env exactly);
+`tune_duplicate_threshold.py` passes against the real Gemini API with
+the exact numbers documented above; `ruff check .` clean; `pip-audit`
+clean, including the new `pgvector` dependency; frontend `ESLint`,
+`tsc --noEmit`, and a full `next build` all clean. Manually verified
+end to end in a real browser this slice (screenshots reviewed
+directly): a near-duplicate correctly warns with a similarity score
+and a link, a genuinely different ticket creates with no warning, a
+second project never sees a match despite identical underlying text,
+and editing a ticket's title/description measurably changes what it
+matches against afterward.

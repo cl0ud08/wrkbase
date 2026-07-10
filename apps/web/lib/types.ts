@@ -157,6 +157,37 @@ export function mapTicketPage(data: TicketPageApiResponse): TicketPage {
   };
 }
 
+// Returned by POST .../tickets/check-duplicates
+// (apps/api/app/services/ticket_duplicates.py). A non-blocking signal --
+// see the project board's DuplicateWarning component, which never
+// prevents a creation form from submitting, only shows what it found.
+export interface DuplicateCandidate {
+  ticketId: string;
+  ticketNumber: number;
+  title: string;
+  similarity: number;
+}
+
+interface DuplicateCandidateApiResponse {
+  ticket_id: string;
+  ticket_number: number;
+  title: string;
+  similarity: number;
+}
+
+interface DuplicateCheckResponseApi {
+  matches: DuplicateCandidateApiResponse[];
+}
+
+export function mapDuplicateCandidates(data: DuplicateCheckResponseApi): DuplicateCandidate[] {
+  return data.matches.map((m) => ({
+    ticketId: m.ticket_id,
+    ticketNumber: m.ticket_number,
+    title: m.title,
+    similarity: m.similarity,
+  }));
+}
+
 // Returned by POST .../tickets/parse (apps/api/app/services/ticket_parse.py)
 // -- never persisted, never a Ticket. confident=true guarantees title and
 // type are both present; confident=false guarantees clarification is

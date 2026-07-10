@@ -17,11 +17,13 @@ import { CSS } from "@dnd-kit/utilities";
 import { apiFetch } from "../../../../lib/api";
 import { useAuth } from "../../../../lib/auth-context";
 import {
+  mapDuplicateCandidates,
   mapMember,
   mapParsedTicketCandidate,
   mapTicket,
   mapTicketUpdatedEvent,
   mapWorkflowState,
+  type DuplicateCandidate,
   type Member,
   type ParsedTicketCandidate,
   type Ticket,
@@ -128,6 +130,63 @@ function TriageIndicator({ ticket }: { ticket: Ticket }) {
 // parent ticket that free text alone can't determine.
 const PARSE_TYPE_OPTIONS: Exclude<TicketType, "subtask">[] = ["epic", "story", "task"];
 
+// Non-blocking by construction: a failed check (network error, the
+// backend's own 503 when both embedding attempts are exhausted) just
+// means no warning is shown, never something that stops a ticket from
+// being created — the same "don't hard-block on an AI feature" pattern
+// as everywhere else this app calls out to an LLM synchronously.
+async function checkDuplicates(
+  projectId: string,
+  title: string,
+  description: string | null,
+): Promise<DuplicateCandidate[]> {
+  const res = await apiFetch(`/api/projects/${projectId}/tickets/check-duplicates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, description }),
+  });
+  if (!res.ok) return [];
+  return mapDuplicateCandidates(await res.json());
+}
+
+// No single-ticket page exists in this app yet (only the board, backlog,
+// and sprint views) -- links point at the board itself, the closest
+// existing place a human can actually go find the matched ticket, rather
+// than a deep link this app has nowhere to send them to yet.
+function DuplicateWarning({
+  projectId,
+  ticketPrefix,
+  matches,
+}: {
+  projectId: string;
+  ticketPrefix: string;
+  matches: DuplicateCandidate[];
+}) {
+  if (matches.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md bg-warning-bg px-3 py-2 text-sm text-warning">
+      <p>Possible duplicate{matches.length > 1 ? "s" : ""} found:</p>
+      <ul className="flex flex-col gap-1">
+        {matches.map((m) => (
+          <li key={m.ticketId} className="flex items-center gap-1.5">
+            <a
+              href={`/projects/${projectId}`}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:no-underline"
+            >
+              {ticketPrefix}-{m.ticketNumber}: {m.title}
+            </a>
+            <span className="text-[11px] text-ink-tertiary">
+              ({Math.round(m.similarity * 100)}% similar)
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // Natural-language ticket creation: parse, then review/edit, then confirm
 // — never auto-submits on parse, same "don't auto-create silently"
 // principle as everywhere else AI touches this app. Self-contained: owns
@@ -135,10 +194,12 @@ const PARSE_TYPE_OPTIONS: Exclude<TicketType, "subtask">[] = ["epic", "story", "
 // know when it's done (onCreated) or dismissed (onCancel).
 function ParseTicketPanel({
   projectId,
+  ticketPrefix,
   onCreated,
   onCancel,
 }: {
   projectId: string;
+  ticketPrefix: string;
   onCreated: () => Promise<void>;
   onCancel: () => void;
 }) {
@@ -150,11 +211,20 @@ function ParseTicketPanel({
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [editType, setEditType] = useState<Exclude<TicketType, "subtask">>("task");
+  const [duplicates, setDuplicates] = useState<DuplicateCandidate[]>([]);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
+
+  async function runDuplicateCheck(title: string, description: string | null) {
+    setCheckingDuplicates(true);
+    setDuplicates(await checkDuplicates(projectId, title, description));
+    setCheckingDuplicates(false);
+  }
 
   async function handleParse(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setCandidate(null);
+    setDuplicates([]);
     setParsing(true);
 
     const res = await apiFetch(`/api/projects/${projectId}/tickets/parse`, {
@@ -170,6 +240,12 @@ function ParseTicketPanel({
         setEditTitle(parsed.title ?? "");
         setEditDescription(parsed.description ?? "");
         setEditType((parsed.type as Exclude<TicketType, "subtask">) ?? "task");
+        // The user is reviewing this candidate right now, deciding
+        // whether to create it -- the same "there's a waiting caller"
+        // moment that makes the parse call itself synchronous applies
+        // here too, so the check runs immediately rather than waiting
+        // for an explicit action.
+        await runDuplicateCheck(parsed.title ?? "", parsed.description);
       }
     } else {
       const data = await res.json().catch(() => null);
@@ -255,6 +331,7 @@ function ParseTicketPanel({
                 setEditDescription("");
                 setEditType("task");
                 setCandidate({ ...candidate, confident: true });
+                setDuplicates([]);
               }}
               className="self-start rounded-md px-3 py-1.5 text-sm font-medium text-ink-secondary hover:text-ink"
             >
@@ -303,14 +380,16 @@ function ParseTicketPanel({
             </div>
           )}
 
+          <DuplicateWarning projectId={projectId} ticketPrefix={ticketPrefix} matches={duplicates} />
+
           {error && <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>}
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
             <button
               type="submit"
               disabled={confirming}
               className="self-start rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
             >
-              {confirming ? "Creating…" : "Create ticket"}
+              {confirming ? "Creating…" : duplicates.length > 0 ? "Create anyway" : "Create ticket"}
             </button>
             <button
               type="button"
@@ -318,6 +397,18 @@ function ParseTicketPanel({
               className="self-start rounded-md px-3 py-1.5 text-sm font-medium text-ink-secondary hover:text-ink"
             >
               Back
+            </button>
+            {/* Edits to title/description above don't auto-re-check --
+                that would need debouncing to avoid a request per
+                keystroke. This lets a user who changed their mind about
+                the wording re-check on demand instead. */}
+            <button
+              type="button"
+              disabled={checkingDuplicates}
+              onClick={() => runDuplicateCheck(editTitle, editDescription || null)}
+              className="self-start text-xs text-ink-tertiary underline hover:text-ink-secondary disabled:opacity-50"
+            >
+              {checkingDuplicates ? "Checking…" : "Check again"}
             </button>
           </div>
         </form>
@@ -486,6 +577,8 @@ export default function ProjectBoardPage() {
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
+  const [duplicates, setDuplicates] = useState<DuplicateCandidate[]>([]);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
@@ -567,8 +660,25 @@ export default function ProjectBoardPage() {
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setSubmitting(true);
 
+    // First submit: check for duplicates instead of creating right away
+    // -- if any are found, show them and wait for a second, explicit
+    // "Create anyway" click rather than silently creating. Once
+    // `duplicates` is populated for the *current* title, this branch is
+    // skipped and the ticket is created directly -- same non-blocking
+    // "let the user proceed or reconsider" shape as the NL-parse review
+    // step, just compressed into one form instead of two steps.
+    if (duplicates.length === 0) {
+      setCheckingDuplicates(true);
+      const found = await checkDuplicates(projectId, title, null);
+      setCheckingDuplicates(false);
+      if (found.length > 0) {
+        setDuplicates(found);
+        return;
+      }
+    }
+
+    setSubmitting(true);
     const res = await apiFetch(`/api/projects/${projectId}/tickets`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -577,6 +687,7 @@ export default function ProjectBoardPage() {
 
     if (res.ok) {
       setTitle("");
+      setDuplicates([]);
       setActiveForm(null);
       await load();
     } else {
@@ -712,18 +823,37 @@ export default function ProjectBoardPage() {
             className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink transition-colors duration-100 hover:border-line-strong"
             placeholder="Ticket title"
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              // The title changed since duplicates (if any) were
+              // computed -- those results no longer describe what's
+              // about to be submitted, so the next submit should check
+              // again rather than silently reuse a stale warning (or
+              // worse, a stale *absence* of one).
+              setDuplicates([]);
+            }}
             required
+          />
+          <DuplicateWarning
+            projectId={projectId}
+            ticketPrefix={user?.ticketPrefix ?? "TKT"}
+            matches={duplicates}
           />
           {error && (
             <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">{error}</p>
           )}
           <button
             type="submit"
-            disabled={submitting}
+            disabled={submitting || checkingDuplicates}
             className="self-start rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-accent-on transition-colors duration-100 hover:bg-accent-hover disabled:opacity-50"
           >
-            {submitting ? "Creating…" : "Create"}
+            {submitting
+              ? "Creating…"
+              : checkingDuplicates
+                ? "Checking…"
+                : duplicates.length > 0
+                  ? "Create anyway"
+                  : "Create"}
           </button>
         </form>
       )}
@@ -731,6 +861,7 @@ export default function ProjectBoardPage() {
       {activeForm === "describe" && (
         <ParseTicketPanel
           projectId={projectId}
+          ticketPrefix={user?.ticketPrefix ?? "TKT"}
           onCreated={async () => {
             setActiveForm(null);
             await load();
